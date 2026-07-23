@@ -28,7 +28,7 @@ def callback():
         abort(400)
     return 'OK'
 
-@handler.add(MessageEvent, message_cls=ImageMessageContent)
+@handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image(event):
     with ApiClient(configuration) as api_client:
         blob_api = MessagingApiBlob(api_client)
