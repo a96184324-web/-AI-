@@ -26,6 +26,8 @@ GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
+
+# 以前動いていた標準構成（変な自動リトライを発生させない）
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
@@ -44,19 +46,14 @@ def callback():
 
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image(event):
-  reply_text = None
-
   with ApiClient(configuration) as api_client:
     messaging_api = MessagingApi(api_client)
 
     try:
-      # 1. LINEから画像を取得
+      # LINEから画像を取得
       blob_api = MessagingApiBlob(api_client)
       image_bytes = blob_api.get_message_content(message_id=event.message.id)
       image = Image.open(io.BytesIO(image_bytes))
-
-      # 2. 認識精度を一切落とさずに転送速度を最適化（長辺2048px）
-      image.thumbnail((2048, 2048))
 
       prompt = (
           '送られた画像（出馬表など）を解析し、まずは【開催競馬場】を特定してください。\n\n'
@@ -84,31 +81,21 @@ def handle_image(event):
           '※馬券購入は自己責任'
       )
 
-      # 最高頭脳の gemini-3.5-flash を最優先し、ダメなら 1.5-flash へ
-      candidate_models = ['gemini-3.5-flash', 'gemini-1.5-flash']
+      # 確実に存在する標準モデル1本に固定
+      response = ai_client.models.generate_content(
+          model='gemini-1.5-flash', contents=[image, prompt]
+      )
 
-      for model_name in candidate_models:
-        try:
-          response = ai_client.models.generate_content(
-              model=model_name, contents=[image, prompt]
-          )
-          if response and response.text:
-            reply_text = response.text
-            break
-        except Exception as m_err:
-          logging.warning(f'Model {model_name} failed: {m_err}')
-          continue
-
-      if not reply_text:
-        reply_text = (
-            '⚠️ 現在GoogleのAIサーバーが非常に混雑しています。1〜2分置いてから再度画像を送信してみてください。'
-        )
+      if response and response.text:
+        reply_text = response.text
+      else:
+        reply_text = '⚠️ AIからの応答が得られませんでした。'
 
     except Exception as e:
       logging.error(f'System error: {e}')
-      reply_text = f'⚠️ 処理エラーが発生しました: {str(e)}'
+      reply_text = f'⚠️ エラーが発生しました: {str(e)}'
 
-    # LINE返信処理の防衛（エラーでプログラムをクラッシュさせない）
+    # LINEへ返信
     try:
       messaging_api.reply_message(
           ReplyMessageRequest(
