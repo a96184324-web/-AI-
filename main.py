@@ -26,8 +26,6 @@ GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
-
-# 以前動いていた標準構成（変な自動リトライを発生させない）
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
@@ -55,6 +53,9 @@ def handle_image(event):
       image_bytes = blob_api.get_message_content(message_id=event.message.id)
       image = Image.open(io.BytesIO(image_bytes))
 
+      # 解像度を最適化（認識精度を落とさず通信を最速化）
+      image.thumbnail((2048, 2048))
+
       prompt = (
           '送られた画像（出馬表など）を解析し、まずは【開催競馬場】を特定してください。\n\n'
           '【重要事項：ハルシネーション禁止 ＆ クレジット削減】\n'
@@ -81,19 +82,31 @@ def handle_image(event):
           '※馬券購入は自己責任'
       )
 
-      # 確実に存在する標準モデル1本に固定
-      response = ai_client.models.generate_content(
-          model='gemini-1.5-flash', contents=[image, prompt]
-      )
+      # 廃止された1.5は削除し、2026年最新の最速・低コストモデル「3.1-flash-lite」を主軸に設定
+      candidate_models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash']
+      reply_text = None
+      error_logs = []
 
-      if response and response.text:
-        reply_text = response.text
-      else:
-        reply_text = '⚠️ AIからの応答が得られませんでした。'
+      for model_name in candidate_models:
+        try:
+          response = ai_client.models.generate_content(
+              model=model_name, contents=[image, prompt]
+          )
+          if response and response.text:
+            reply_text = response.text
+            break
+        except Exception as m_err:
+          error_logs.append(f'[{model_name}] {m_err}')
+          continue
+
+      if not reply_text:
+        # 万が一すべて失敗した場合はエラー内容をまとめる
+        err_str = " / ".join(error_logs)
+        reply_text = f'⚠️ AIサーバーでエラーが発生しました。\n詳細: {err_str}'
 
     except Exception as e:
       logging.error(f'System error: {e}')
-      reply_text = f'⚠️ エラーが発生しました: {str(e)}'
+      reply_text = f'⚠️ システムエラーが発生しました: {str(e)}'
 
     # LINEへ返信
     try:
@@ -105,7 +118,6 @@ def handle_image(event):
       )
     except Exception as line_err:
       logging.error(f'Failed to send LINE reply: {line_err}')
-
 
 if __name__ == '__main__':
   port = int(os.environ.get('PORT', 5000))
