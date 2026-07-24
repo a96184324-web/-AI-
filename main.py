@@ -73,14 +73,13 @@ def handle_image(event):
           '※馬券購入は自己責任'
       )
 
-      # 実際に有効な最新のフラッシュモデルのみを順番に試行
       candidate_models = [
           'gemini-2.5-flash',
           'gemini-3.5-flash',
           'gemini-2.0-flash',
       ]
       reply_text = None
-      logs = []
+      error_logs = []
 
       for model_name in candidate_models:
         try:
@@ -91,15 +90,16 @@ def handle_image(event):
             reply_text = response.text
             break
         except Exception as e:
-          logs.append(f'{model_name}: {str(e)}')
+          # 各モデルで発生した本当のエラー内容をログに保持
+          error_logs.append(f'[{model_name}]: {str(e)}')
 
       if not reply_text:
-        reply_text = (
-            '⚠️ 現在すべてのAIサーバーが混雑しています。1〜2分ほど置いてから再度お試しください。'
-        )
+        # 万が一失敗した場合は、実際のエラー内容をそのまま表示
+        err_detail = '\n'.join(error_logs)
+        reply_text = f'⚠️ エラー詳細:\n{err_detail}'
 
     except Exception as e:
-      reply_text = f'⚠️ システムエラーが発生しました: {str(e)}'
+      reply_text = f'⚠️ 処理エラーが発生しました: {str(e)}'
 
     messaging_api.reply_message(
         ReplyMessageRequest(
