@@ -1,6 +1,5 @@
 import io
 import os
-import time
 from flask import Flask, abort, request
 from google import genai
 from linebot.v3 import WebhookHandler
@@ -74,31 +73,33 @@ def handle_image(event):
           '※馬券購入は自己責任'
       )
 
-      # 混雑を回避するためのモデル自動切り替え（2.5-flash ⇔ 3.5-flash）＆3秒リトライ
-      candidate_models = ['gemini-2.5-flash', 'gemini-3.5-flash']
+      # 実際に有効な最新のフラッシュモデルのみを順番に試行
+      candidate_models = [
+          'gemini-2.5-flash',
+          'gemini-3.5-flash',
+          'gemini-2.0-flash',
+      ]
       reply_text = None
+      logs = []
 
       for model_name in candidate_models:
-        for attempt in range(2):
-          try:
-            response = ai_client.models.generate_content(
-                model=model_name, contents=[image, prompt]
-            )
-            if response and response.text:
-              reply_text = response.text
-              break
-          except Exception:
-            time.sleep(3)  # 混雑時は3秒待機して再試行
-        if reply_text:
-          break
+        try:
+          response = ai_client.models.generate_content(
+              model=model_name, contents=[image, prompt]
+          )
+          if response and response.text:
+            reply_text = response.text
+            break
+        except Exception as e:
+          logs.append(f'{model_name}: {str(e)}')
 
       if not reply_text:
         reply_text = (
-            '⚠️ 現在GoogleのAIサーバーが非常に混雑しています。1〜2分ほど時間を置いてから、再度画像を送信してみてください。'
+            '⚠️ 現在すべてのAIサーバーが混雑しています。1〜2分ほど置いてから再度お試しください。'
         )
 
     except Exception as e:
-      reply_text = f'⚠️ 処理エラーが発生しました: {str(e)}'
+      reply_text = f'⚠️ システムエラーが発生しました: {str(e)}'
 
     messaging_api.reply_message(
         ReplyMessageRequest(
