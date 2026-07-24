@@ -61,18 +61,29 @@ def handle_image(event):
                 "※馬券購入は自己責任"
             )
 
-            response = ai_client.models.generate_content(
-                model='gemini-3.5-flash',
-                contents=[image, prompt]
-            )
-            reply_text = response.text
+            # 混雑時に備えて複数のモデルを試行するロジック
+            candidate_models = ['gemini-2.5-flash', 'gemini-3.5-flash', 'gemini-2.0-flash']
+            reply_text = None
+            last_error = None
+
+            for model_name in candidate_models:
+                try:
+                    response = ai_client.models.generate_content(
+                        model=model_name,
+                        contents=[image, prompt]
+                    )
+                    if response and response.text:
+                        reply_text = response.text
+                        break
+                except Exception as model_err:
+                    last_error = model_err
+                    continue
+
+            if not reply_text:
+                reply_text = f"⚠️ AIモデルの呼び出しに失敗しました: {str(last_error)}"
 
         except Exception as e:
-            # 503などのGoogleサーバー一時混雑エラーの対策メッセージ
-            if "503" in str(e) or "UNAVAILABLE" in str(e):
-                reply_text = "⚠️ 現在GoogleのAIサーバーが混雑しています。数秒あけてから、再度画像を送信してみてください。"
-            else:
-                reply_text = f"⚠️ エラーが発生しました: {str(e)}"
+            reply_text = f"⚠️ 処理エラーが発生しました: {str(e)}"
 
         messaging_api.reply_message(
             ReplyMessageRequest(
