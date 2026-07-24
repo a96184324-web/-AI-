@@ -74,23 +74,28 @@ def handle_image(event):
           '※馬券購入は自己責任'
       )
 
-      # gemini-3.5-flash のみを使用し、混雑時は最大3回自動で再試行する
+      # 混雑を回避するためのモデル自動切り替え（2.5-flash ⇔ 3.5-flash）＆3秒リトライ
+      candidate_models = ['gemini-2.5-flash', 'gemini-3.5-flash']
       reply_text = None
-      max_retries = 3
 
-      for attempt in range(max_retries):
-        try:
-          response = ai_client.models.generate_content(
-              model='gemini-3.5-flash', contents=[image, prompt]
-          )
-          if response and response.text:
-            reply_text = response.text
-            break
-        except Exception as err:
-          if attempt < max_retries - 1:
-            time.sleep(2)  # 2秒待機して自動リトライ
-          else:
-            reply_text = f'⚠️ 応答エラー: {str(err)}'
+      for model_name in candidate_models:
+        for attempt in range(2):
+          try:
+            response = ai_client.models.generate_content(
+                model=model_name, contents=[image, prompt]
+            )
+            if response and response.text:
+              reply_text = response.text
+              break
+          except Exception:
+            time.sleep(3)  # 混雑時は3秒待機して再試行
+        if reply_text:
+          break
+
+      if not reply_text:
+        reply_text = (
+            '⚠️ 現在GoogleのAIサーバーが非常に混雑しています。1〜2分ほど時間を置いてから、再度画像を送信してみてください。'
+        )
 
     except Exception as e:
       reply_text = f'⚠️ 処理エラーが発生しました: {str(e)}'
