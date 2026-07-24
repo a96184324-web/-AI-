@@ -1,5 +1,6 @@
 import io
 import os
+import time
 from flask import Flask, abort, request
 from google import genai
 from linebot.v3 import WebhookHandler
@@ -73,29 +74,23 @@ def handle_image(event):
           '※馬券購入は自己責任'
       )
 
-      # 有効な現行モデルのみを指定（旧モデルgemini-2.0を排除）
-      candidate_models = [
-          'gemini-3.5-flash',
-          'gemini-2.5-flash',
-          'gemini-2.5-pro',
-      ]
+      # gemini-3.5-flash のみを使用し、混雑時は最大3回自動で再試行する
       reply_text = None
-      last_error = None
+      max_retries = 3
 
-      for model_name in candidate_models:
+      for attempt in range(max_retries):
         try:
           response = ai_client.models.generate_content(
-              model=model_name, contents=[image, prompt]
+              model='gemini-3.5-flash', contents=[image, prompt]
           )
           if response and response.text:
             reply_text = response.text
             break
-        except Exception as model_err:
-          last_error = model_err
-          continue
-
-      if not reply_text:
-        reply_text = f'⚠️ AIモデルの呼び出しに失敗しました: {str(last_error)}'
+        except Exception as err:
+          if attempt < max_retries - 1:
+            time.sleep(2)  # 2秒待機して自動リトライ
+          else:
+            reply_text = f'⚠️ 応答エラー: {str(err)}'
 
     except Exception as e:
       reply_text = f'⚠️ 処理エラーが発生しました: {str(e)}'
