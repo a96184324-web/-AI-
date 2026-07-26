@@ -45,7 +45,6 @@ def load_baba_data():
     try:
       with open(BABA_FILE, 'r', encoding='utf-8') as f:
         data = json.load(f)
-        # 保存日付が今日と異なる場合はリセット（空を返す）
         if data.get('date') != get_jst_today():
           return {}
         return data.get('data', {})
@@ -87,7 +86,6 @@ def handle_image(event):
     reply_text = None
 
     try:
-      # LINEから画像を取得
       blob_api = MessagingApiBlob(api_client)
       image_bytes = blob_api.get_message_content(message_id=event.message.id)
       image = Image.open(io.BytesIO(image_bytes))
@@ -95,9 +93,6 @@ def handle_image(event):
 
       candidate_models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash']
 
-      # ----------------------------------------------------
-      # ステップ1: 画像の自動判別（馬場情報か出馬表か）
-      # ----------------------------------------------------
       classify_prompt = (
           '送られた画像を判定してください。\n'
           'JRAなどの「馬場情報（天候、芝・ダートの馬場状態）」の画面であれば "BABA" と答えてください。\n'
@@ -118,9 +113,6 @@ def handle_image(event):
         except Exception:
           continue
 
-      # ----------------------------------------------------
-      # パターンA: 画像が「馬場情報」の場合
-      # ----------------------------------------------------
       if image_type == 'BABA':
         extract_prompt = (
             'この馬場情報画像から【競馬場名】、【天候】、【芝の馬場状態】、【ダートの馬場状態】を抽出し、以下のJSON形式のみで出力してください。\n'
@@ -163,9 +155,6 @@ def handle_image(event):
         else:
           reply_text = '⚠️ 馬場情報の読み取りに失敗しました。もう一度はっきり映った画像を送信してください。'
 
-      # ----------------------------------------------------
-      # パターンB: 画像が「出馬表」の場合（究極ロジック適用）
-      # ----------------------------------------------------
       else:
         baba_data = load_baba_data()
         baba_context_str = '【現在システムに登録されている本日のリアルタイム馬場情報】\n'
@@ -181,7 +170,7 @@ def handle_image(event):
             + baba_context_str +
             '【絶対厳守事項：ハルシネーション禁止 ＆ 人気・オッズ完全無視】\n'
             '1. 架空のデータや数値をねつ造するハルシネーションは絶対に禁止します。\n'
-            '2. 馬番・馬名・騎手名の正確な紐付け：表組みを読み取る際、必ず「同じ横の行」にある【馬番】【馬名】【騎手名】が正確に一致しているか、出力前に必ずクロスチェック（指差し確認）してください。\n'
+            '2. 【馬番と馬名の完全紐付けルール】：表が細かくAI特有の行ズレ（上の馬名と下の馬番を間違える現象）が起きやすいため、予想処理に入る前に必ず内部で「左から2列目の数字（馬番）」と「すぐ右隣の枠にある太字のカタカナ（馬名）」、「騎手名」のリストをテキスト化して固定し、水平線上のズレがないか確証を得てから評価に進んでください。\n'
             '3. オッズや人気順は一切考慮せず、出馬表の事実のみに基づく【条件合致度（100点満点）】を期待度（%）として絶対評価で算出してください。\n'
             '4. 【評価基準】S: 90〜100%（条件完全合致）、A: 80〜89%（ほぼ合致）、B: 70〜79%（一部合致）としてください。\n'
             '5. 挨拶や無駄な装飾は省き、箇条書きの「*」記号は絶対に使用しないでください。\n'
@@ -248,7 +237,6 @@ def handle_image(event):
       logging.error(f'System error: {e}')
       reply_text = f'⚠️ システムエラーが発生しました: {str(e)}'
 
-    # LINEへ返信
     try:
       messaging_api.reply_message(
           ReplyMessageRequest(
