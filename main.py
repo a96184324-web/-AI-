@@ -162,7 +162,7 @@ def handle_image(event):
               f'📍 競馬場：【{keibajo}競馬場】\n'
               f'🌤 天候：{baba_json.get("tenko", "不明")}\n'
               f'🌿 芝：{baba_json.get("shiba", "不明")}\n'
-              f me="dirt": baba_json.get("dirt", "不明")}\n\n'
+              f'🟫 ダート：{baba_json.get("dirt", "不明")}\n\n'
               '※日付が変わると自動でリセットされます。\n'
               '※本日この競馬場の出馬表が送られた際、血統適性や有利な脚質に自動反映します！'
           )
