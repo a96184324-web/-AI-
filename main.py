@@ -5,6 +5,7 @@ import logging
 import os
 from flask import Flask, abort, request
 from google import genai
+from google.genai import types
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
@@ -93,6 +94,12 @@ def handle_image(event):
 
       candidate_models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash']
 
+      # 予想のブレ（ブレ幅）を完全ゼロにする設定
+      deterministic_config = types.GenerateContentConfig(temperature=0.0)
+
+      # ----------------------------------------------------
+      # ステップ1: 画像の自動判別（馬場情報か出馬表か）
+      # ----------------------------------------------------
       classify_prompt = (
           '送られた画像を判定してください。\n'
           'JRAなどの「馬場情報（天候、芝・ダートの馬場状態）」の画面であれば "BABA" と答えてください。\n'
@@ -104,7 +111,9 @@ def handle_image(event):
       for model_name in candidate_models:
         try:
           res = ai_client.models.generate_content(
-              model=model_name, contents=[image, classify_prompt]
+              model=model_name,
+              contents=[image, classify_prompt],
+              config=deterministic_config
           )
           if res and res.text:
             if 'BABA' in res.text.strip().upper():
@@ -113,6 +122,9 @@ def handle_image(event):
         except Exception:
           continue
 
+      # ----------------------------------------------------
+      # パターンA: 画像が「馬場情報」の場合
+      # ----------------------------------------------------
       if image_type == 'BABA':
         extract_prompt = (
             'この馬場情報画像から【競馬場名】、【天候】、【芝の馬場状態】、【ダートの馬場状態】を抽出し、以下のJSON形式のみで出力してください。\n'
@@ -124,7 +136,9 @@ def handle_image(event):
         for model_name in candidate_models:
           try:
             res = ai_client.models.generate_content(
-                model=model_name, contents=[image, extract_prompt]
+                model=model_name,
+                contents=[image, extract_prompt],
+                config=deterministic_config
             )
             if res and res.text:
               raw_text = res.text.replace('```json', '').replace('```', '').strip()
@@ -145,7 +159,7 @@ def handle_image(event):
 
           reply_text = (
               '【本日の馬場情報を更新・記憶しました】\n'
-              f'📍 競馬場：{keibajo}競馬場\n'
+              f'📍 競馬場：【{keibajo}競馬場】\n'
               f'🌤 天候：{baba_json.get("tenko", "不明")}\n'
               f'🌿 芝：{baba_json.get("shiba", "不明")}\n'
               f'🟫 ダート：{baba_json.get("dirt", "不明")}\n\n'
@@ -155,6 +169,9 @@ def handle_image(event):
         else:
           reply_text = '⚠️ 馬場情報の読み取りに失敗しました。もう一度はっきり映った画像を送信してください。'
 
+      # ----------------------------------------------------
+      # パターンB: 画像が「出馬表」の場合（完全固定予想適用）
+      # ----------------------------------------------------
       else:
         baba_data = load_baba_data()
         baba_context_str = '【現在システムに登録されている本日のリアルタイム馬場情報】\n'
@@ -166,9 +183,9 @@ def handle_image(event):
           baba_context_str += '・登録なし（馬場情報画像未送信のため標準の「良馬場」として判定）\n\n'
 
         prompt = (
-            '送られた画像（出馬表など）を解析し、まずは【開催競馬場】と【距離・馬場】を特定してください。\n\n'
+            '送られた画像（出馬表など）を解析し、まずは【開催競馬場】と【距離・馬場】を正確に特定してください。\n\n'
             + baba_context_str +
-            '【絶対厳守事項：ハルシネーション禁止 ＆ 人気・オッズ完全無視】\n'
+            '【絶対厳守事項：ハルシネーション禁止 ＆ 人気・オッズ完全無視 ＆ 予想の再現性決定】\n'
             '1. 架空のデータや数値をねつ造するハルシネーションは絶対に禁止します。\n'
             '2. 【馬番と馬名の完全紐付けルール】：表が細かくAI特有の行ズレ（上の馬名と下の馬番を間違える現象）が起きやすいため、予想処理に入る前に必ず内部で「左から2列目の数字（馬番）」と「すぐ右隣の枠にある太字のカタカナ（馬名）」、「騎手名」のリストをテキスト化して固定し、水平線上のズレがないか確証を得てから評価に進んでください。\n'
             '3. オッズや人気順は一切考慮せず、出馬表の事実のみに基づく【条件合致度（100点満点）】を期待度（%）として絶対評価で算出してください。\n'
@@ -193,8 +210,8 @@ def handle_image(event):
             '・堅実度B（標準）   ➔ 【馬連・馬単】および【3連複フォーメーション】\n'
             '・堅実度C（混戦）   ➔ 【ワイド】および【3連複フォーメーション】\n\n'
             '【出力フォーマット】\n'
-            '※以下のレイアウトを厳守し、各項目の間には必ず「1行の空白行」を入れてください。\n\n'
-            '■ 1. 競馬場と展開予想 [レースの堅実度：A〜C]\n'
+            '※以下のレイアウトを厳守し、冒頭のレース情報には必ず【開催場・コース種別・距離】を明確に記載してください。\n\n'
+            '■ 1. レース概要：【〇〇 芝/ダ〇〇〇m】 [レースの堅実度：A〜C]\n'
             '（ここに簡潔な展開予想と馬場状態・コース形態の影響を記載）\n\n'
             '■ 2. 印・期待度と推奨理由\n'
             '◎ 【本命】 〇番 馬名（騎手名） [期待度：〇% / 評価：S〜B]\n'
@@ -220,7 +237,9 @@ def handle_image(event):
         for model_name in candidate_models:
           try:
             response = ai_client.models.generate_content(
-                model=model_name, contents=[image, prompt]
+                model=model_name,
+                contents=[image, prompt],
+                config=deterministic_config
             )
             if response and response.text:
               reply_text = response.text
