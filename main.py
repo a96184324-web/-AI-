@@ -18,6 +18,7 @@ from linebot.v3.messaging import (
 )
 from linebot.v3.webhooks import ImageMessageContent, MessageEvent
 from PIL import Image
+import requests
 
 logging.basicConfig(level=logging.INFO)
 
@@ -26,6 +27,9 @@ app = Flask(__name__)
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+
+# GASのウェブアプリURL（埋め込み済み）
+GAS_WEBAPP_URL = 'https://script.google.com/macros/s/AKfycbwsDCHtrbNNFTVbuOPlbTiSwqyNx5YHhiAfgWpcYjGbk1S26NsjL3J4-oheMRs5MWl4/exec'
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -38,6 +42,25 @@ def get_jst_today():
   """日本時間の現在日付（YYYY-MM-DD）を取得"""
   jst = datetime.timezone(datetime.timedelta(hours=9))
   return datetime.datetime.now(jst).strftime('%Y-%m-%d')
+
+
+def send_prediction_to_gas(prediction_text):
+  """予想データを裏でGAS（スプレッドシート）へ自動送信する関数"""
+  if not GAS_WEBAPP_URL:
+    logging.warning('GAS_WEBAPP_URLが設定されていないため自動保存をスキップします。')
+    return
+
+  try:
+    payload = {'date': get_jst_today(), 'prediction_text': prediction_text}
+    response = requests.post(
+        GAS_WEBAPP_URL,
+        data=json.dumps(payload),
+        headers={'Content-Type': 'application/json'},
+        timeout=10,
+    )
+    logging.info(f'GAS Save Response: {response.status_code}')
+  except Exception as e:
+    logging.error(f'Failed to send prediction to GAS: {e}')
 
 
 def load_baba_data():
@@ -57,10 +80,7 @@ def load_baba_data():
 def save_baba_data(baba_dict):
   """馬場情報を現在日付とともにファイルに書き込む"""
   try:
-    data_to_save = {
-        'date': get_jst_today(),
-        'data': baba_dict
-    }
+    data_to_save = {'date': get_jst_today(), 'data': baba_dict}
     with open(BABA_FILE, 'w', encoding='utf-8') as f:
       json.dump(data_to_save, f, ensure_ascii=False, indent=2)
   except Exception as e:
@@ -93,7 +113,6 @@ def handle_image(event):
       image.thumbnail((2048, 2048))
 
       candidate_models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash']
-
       deterministic_config = types.GenerateContentConfig(temperature=0.0)
 
       classify_prompt = (
@@ -107,9 +126,7 @@ def handle_image(event):
       for model_name in candidate_models:
         try:
           res = ai_client.models.generate_content(
-              model=model_name,
-              contents=[image, classify_prompt],
-              config=deterministic_config
+              model=model_name, contents=[image, classify_prompt], config=deterministic_config
           )
           if res and res.text:
             if 'BABA' in res.text.strip().upper():
@@ -129,9 +146,7 @@ def handle_image(event):
         for model_name in candidate_models:
           try:
             res = ai_client.models.generate_content(
-                model=model_name,
-                contents=[image, extract_prompt],
-                config=deterministic_config
+                model=model_name, contents=[image, extract_prompt], config=deterministic_config
             )
             if res and res.text:
               raw_text = res.text.replace('```json', '').replace('```', '').strip()
@@ -214,7 +229,7 @@ def handle_image(event):
             '【選定券種（例：馬連・馬単 など）】\n'
             '軸馬：〇\n'
             '相手：〇, 〇, 〇\n\n'
-            '【選定券種（例：3連複フォーメーション など）】\n'
+            '【選定券種（例：3连複フォーメーション など）】\n'
             '1列目（または1着）：〇\n'
             '2列目（または2着）：〇, 〇\n'
             '3列目（または3着）：〇, 〇, 〇, 〇\n\n'
@@ -225,12 +240,12 @@ def handle_image(event):
         for model_name in candidate_models:
           try:
             response = ai_client.models.generate_content(
-                model=model_name,
-                contents=[image, prompt],
-                config=deterministic_config
+                model=model_name, contents=[image, prompt], config=deterministic_config
             )
             if response and response.text:
               reply_text = response.text
+              # 予想成功時にGAS（スプレッドシート）へ自動送信
+              send_prediction_to_gas(reply_text)
               break
           except Exception as m_err:
             error_logs.append(f'[{model_name}] {m_err}')
