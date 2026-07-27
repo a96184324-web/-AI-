@@ -107,7 +107,7 @@ def callback():
 
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image(event):
-  # ★重複チェック：同一メッセージIDの処理なら2回目の処理を即座に無視する
+  # 重複チェック：同一メッセージIDの処理なら2回目の処理を即座に無視する
   msg_id = event.message.id
   if msg_id in processed_message_ids:
     logging.info(f'Duplicate message ID detected: {msg_id}. Skipping.')
@@ -127,7 +127,8 @@ def handle_image(event):
       image = Image.open(io.BytesIO(image_bytes))
       image.thumbnail((2048, 2048))
 
-      candidate_models = ['gemini-2.5-flash', 'gemini-1.5-flash']
+      # ★さきほど動いていた正確なモデル名に完全復元
+      candidate_models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash']
       deterministic_config = types.GenerateContentConfig(temperature=0.0)
 
       classify_prompt = (
@@ -259,7 +260,7 @@ def handle_image(event):
             )
             if response and response.text:
               reply_text = response.text
-              # ★バックグラウンドでGASへ即時送信
+              # バックグラウンドでGASへ即時送信
               send_prediction_to_gas_async(reply_text)
               break
           except Exception as m_err:
@@ -274,7 +275,7 @@ def handle_image(event):
       logging.error(f'System error: {e}')
       reply_text = f'⚠️ システムエラーが発生しました: {str(e)}'
 
-    # ★LINEの5000文字上限オーバー防止対策
+    # LINEの文字数上限（5000文字）オーバー防止
     if reply_text and len(reply_text) > 4900:
       reply_text = reply_text[:4900] + '\n...(以下省略)'
 
