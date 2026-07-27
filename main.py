@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import threading
 from flask import Flask, abort, request
 from google import genai
 from google.genai import types
@@ -28,7 +29,6 @@ LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 
-# ★ 最新のGASウェブアプリURL（アクセス権：「全員」設定済み）
 GAS_WEBAPP_URL = 'https://script.google.com/macros/s/AKfycbzfjZCmbso00IgujgFfi2KoGV-9JbnEv16FaoH8FSicJtzPA5kYdhohY2Mxn268xrMRvA/exec'
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
@@ -37,6 +37,9 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 BABA_FILE = 'baba_info.json'
 
+# ★LINEのリトライ（自動再送信）による重複を弾くためのメモ欄
+processed_message_ids = set()
+
 
 def get_jst_today():
   """日本時間の現在日付（YYYY-MM-DD）を取得"""
@@ -44,27 +47,28 @@ def get_jst_today():
   return datetime.datetime.now(jst).strftime('%Y-%m-%d')
 
 
-def send_prediction_to_gas(prediction_text):
-  """予想データを裏でGAS（スプレッドシート）へ自動送信する関数"""
-  if not GAS_WEBAPP_URL:
-    logging.warning('GAS_WEBAPP_URLが設定されていないため自動保存をスキップします。')
-    return
+def send_prediction_to_gas_async(prediction_text):
+  """バックグラウンドでGASへ送信（LINEの返信待ちによるタイムアウト・リトライを防止）"""
+  def _send():
+    if not GAS_WEBAPP_URL:
+      return
+    try:
+      payload = {'date': get_jst_today(), 'prediction_text': prediction_text}
+      response = requests.post(
+          GAS_WEBAPP_URL,
+          data=json.dumps(payload),
+          headers={'Content-Type': 'application/json'},
+          timeout=15,
+      )
+      logging.info(f'GAS Save Response: {response.status_code}')
+    except Exception as e:
+      logging.error(f'Failed to send prediction to GAS: {e}')
 
-  try:
-    payload = {'date': get_jst_today(), 'prediction_text': prediction_text}
-    response = requests.post(
-        GAS_WEBAPP_URL,
-        data=json.dumps(payload),
-        headers={'Content-Type': 'application/json'},
-        timeout=10,
-    )
-    logging.info(f'GAS Save Response: {response.status_code}')
-  except Exception as e:
-    logging.error(f'Failed to send prediction to GAS: {e}')
+  thread = threading.Thread(target=_send)
+  thread.start()
 
 
 def load_baba_data():
-  """保存されている馬場情報を読み込み、日付が古ければリセットする"""
   if os.path.exists(BABA_FILE):
     try:
       with open(BABA_FILE, 'r', encoding='utf-8') as f:
@@ -78,7 +82,6 @@ def load_baba_data():
 
 
 def save_baba_data(baba_dict):
-  """馬場情報を現在日付とともにファイルに書き込む"""
   try:
     data_to_save = {'date': get_jst_today(), 'data': baba_dict}
     with open(BABA_FILE, 'w', encoding='utf-8') as f:
@@ -102,13 +105,23 @@ def callback():
 
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image(event):
+  # ★重複チェック：同一メッセージIDの処理なら2回目の処理を即座に無視する
+  msg_id = event.message.id
+  if msg_id in processed_message_ids:
+    logging.info(f'Duplicate message ID detected: {msg_id}. Skipping.')
+    return
+  processed_message_ids.add(msg_id)
+
+  if len(processed_message_ids) > 100:
+    processed_message_ids.clear()
+
   with ApiClient(configuration) as api_client:
     messaging_api = MessagingApi(api_client)
     reply_text = None
 
     try:
       blob_api = MessagingApiBlob(api_client)
-      image_bytes = blob_api.get_message_content(message_id=event.message.id)
+      image_bytes = blob_api.get_message_content(message_id=msg_id)
       image = Image.open(io.BytesIO(image_bytes))
       image.thumbnail((2048, 2048))
 
@@ -244,8 +257,8 @@ def handle_image(event):
             )
             if response and response.text:
               reply_text = response.text
-              # ★ 最新URLへの自動保存呼び出し
-              send_prediction_to_gas(reply_text)
+              # ★バックグラウンドでGASへ即時送信（LINEタイムアウト防止）
+              send_prediction_to_gas_async(reply_text)
               break
           except Exception as m_err:
             error_logs.append(f'[{model_name}] {m_err}')
