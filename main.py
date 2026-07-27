@@ -37,7 +37,7 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 BABA_FILE = 'baba_info.json'
 
-# ★LINEのリトライ（自動再送信）による重複を弾くためのメモ欄
+# LINE自動リトライによる重複処理を防止するメモリ
 processed_message_ids = set()
 
 
@@ -48,7 +48,7 @@ def get_jst_today():
 
 
 def send_prediction_to_gas_async(prediction_text):
-  """バックグラウンドでGASへ送信（LINEの返信待ちによるタイムアウト・リトライを防止）"""
+  """バックグラウンドでGASへ送信（LINEの返信遅延によるタイムアウトを防止）"""
   def _send():
     if not GAS_WEBAPP_URL:
       return
@@ -69,6 +69,7 @@ def send_prediction_to_gas_async(prediction_text):
 
 
 def load_baba_data():
+  """保存されている馬場情報を読み込み、日付が古ければリセットする"""
   if os.path.exists(BABA_FILE):
     try:
       with open(BABA_FILE, 'r', encoding='utf-8') as f:
@@ -82,6 +83,7 @@ def load_baba_data():
 
 
 def save_baba_data(baba_dict):
+  """馬場情報を現在日付とともにファイルに書き込む"""
   try:
     data_to_save = {'date': get_jst_today(), 'data': baba_dict}
     with open(BABA_FILE, 'w', encoding='utf-8') as f:
@@ -125,7 +127,7 @@ def handle_image(event):
       image = Image.open(io.BytesIO(image_bytes))
       image.thumbnail((2048, 2048))
 
-      candidate_models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash']
+      candidate_models = ['gemini-2.5-flash', 'gemini-1.5-flash']
       deterministic_config = types.GenerateContentConfig(temperature=0.0)
 
       classify_prompt = (
@@ -257,7 +259,7 @@ def handle_image(event):
             )
             if response and response.text:
               reply_text = response.text
-              # ★バックグラウンドでGASへ即時送信（LINEタイムアウト防止）
+              # ★バックグラウンドでGASへ即時送信
               send_prediction_to_gas_async(reply_text)
               break
           except Exception as m_err:
@@ -271,6 +273,10 @@ def handle_image(event):
     except Exception as e:
       logging.error(f'System error: {e}')
       reply_text = f'⚠️ システムエラーが発生しました: {str(e)}'
+
+    # ★LINEの5000文字上限オーバー防止対策
+    if reply_text and len(reply_text) > 4900:
+      reply_text = reply_text[:4900] + '\n...(以下省略)'
 
     try:
       messaging_api.reply_message(
