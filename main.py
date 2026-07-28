@@ -37,18 +37,15 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 BABA_FILE = 'baba_info.json'
 
-# LINE自動リトライによる重複処理を防止するメモリ
 processed_message_ids = set()
 
 
 def get_jst_today():
-  """日本時間の現在日付（YYYY-MM-DD）を取得"""
   jst = datetime.timezone(datetime.timedelta(hours=9))
   return datetime.datetime.now(jst).strftime('%Y-%m-%d')
 
 
 def send_prediction_to_gas_async(prediction_text):
-  """バックグラウンドでGASへ送信（LINEの返信遅延によるタイムアウトを防止）"""
   def _send():
     if not GAS_WEBAPP_URL:
       return
@@ -68,8 +65,27 @@ def send_prediction_to_gas_async(prediction_text):
   thread.start()
 
 
+def fetch_accumulated_trends_from_gas():
+  """GASから蓄積された傾向データ（馬場・注意馬名・印傾向）を取得する"""
+  if not GAS_WEBAPP_URL:
+    return ''
+  try:
+    payload = {'action': 'get_trends'}
+    response = requests.post(
+        GAS_WEBAPP_URL,
+        data=json.dumps(payload),
+        headers={'Content-Type': 'application/json'},
+        timeout=5,
+    )
+    if response.status_code == 200:
+      res_json = response.json()
+      return res_json.get('trend_info', '')
+  except Exception as e:
+    logging.error(f'Failed to fetch trends: {e}')
+  return ''
+
+
 def load_baba_data():
-  """保存されている馬場情報を読み込み、日付が古ければリセットする"""
   if os.path.exists(BABA_FILE):
     try:
       with open(BABA_FILE, 'r', encoding='utf-8') as f:
@@ -83,7 +99,6 @@ def load_baba_data():
 
 
 def save_baba_data(baba_dict):
-  """馬場情報を現在日付とともにファイルに書き込む"""
   try:
     data_to_save = {'date': get_jst_today(), 'data': baba_dict}
     with open(BABA_FILE, 'w', encoding='utf-8') as f:
@@ -107,7 +122,6 @@ def callback():
 
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image(event):
-  # 重複チェック：同一メッセージIDの処理なら2回目の処理を即座に無視する
   msg_id = event.message.id
   if msg_id in processed_message_ids:
     logging.info(f'Duplicate message ID detected: {msg_id}. Skipping.')
@@ -127,7 +141,6 @@ def handle_image(event):
       image = Image.open(io.BytesIO(image_bytes))
       image.thumbnail((2048, 2048))
 
-      # ★さきほど動いていた正確なモデル名に完全復元
       candidate_models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash']
       deterministic_config = types.GenerateContentConfig(temperature=0.0)
 
@@ -203,15 +216,27 @@ def handle_image(event):
         else:
           baba_context_str += '・登録なし（馬場情報画像未送信のため標準の「良馬場」として判定）\n\n'
 
+        # ★スプレッドシートから最新の蓄積データ（バイアス・注意馬名など）を読み出し
+        accumulated_trends = fetch_accumulated_trends_from_gas()
+        trend_context_str = ''
+        if accumulated_trends:
+          trend_context_str = (
+              '【システムが記憶している過去のレース結果・学習データ】\n'
+              + accumulated_trends
+              + '\n※【重要指示】：上記データに記載されている「巻き返し注意馬（馬名）」が出走馬に含まれる場合、前走の着順に関わらず評価を上げて加点してください。\n\n'
+          )
+
         prompt = (
-            '送られた画像（出馬表など）を解析し、まずは【開催競馬場】と【距離・馬場】を正確に特定してください。\n\n'
-            + baba_context_str +
-            '【絶対厳守事項：ハルシネーション禁止 ＆ 人気・オッズ完全無視】\n'
-            '1. 【数字の超厳格読み取り】：文字認識の精度を上げるため、予想を始める前に必ず画像内の過去成績にある「着差（カッコ内の数字）」「通過順（ハイフン区切りの数字）」「上がり3F（3F 〇〇.〇）」を慎重に視認し、見間違いがないか確認してから評価に移行してください。\n'
-            '2. 【馬番・馬名・騎手名の紐付け】：画像から「馬番」「馬名」「騎手名」を正しく読み取り、「〇番 馬名（騎手名）」の形式で必ず出力してください。読めない騎手名の捏造は厳禁です。\n'
-            '3. 【印と買い目の完全一致ルール】：『■ 3. おすすめの買い目』に含まれるすべての馬番は、必ず『■ 2. 印・期待度と推奨理由』の中に◎・◯・▲・☆・△（連下）のいずれかの印をつけて掲載してください。買い目にしか登場しない印なしの謎の馬番が存在することは絶対に禁止します。\n'
-            '4. オッズや人気順は一切考慮せず、出馬表の事実のみに基づく【条件合致度（100点満点）】を期待度（%）として絶対評価で算出してください。\n'
-            '5. 出力の最後の行には、省略せず必ず「※馬券購入は自己責任でお願いします」と記載してください。\n\n'
+            '送られた画像（出馬表など）を解析し、まずは【開催競馬場・何レース目か（〇R）】と【距離・馬場】を正確に特定してください。\n\n'
+            + baba_context_str
+            + trend_context_str
+            + '【絶対厳守事項：ハルシネーション禁止 ＆ 人気・オッズ完全無視】\n'
+            '1. 【レース番号の絶対抽出】：冒頭のタイトル【〇〇 芝/ダ〇〇〇m】には、必ず「開催場」と「何レース目か（例: 11R）」をセットで『【新潟11R 芝1200m】』のように明確に記載してください。レース番号を省略することは絶対に禁止します。\n'
+            '2. 【数字の超厳格読み取り】：文字認識の精度を上げるため、予想を始める前に必ず画像内の過去成績にある「着差（カッコ内の数字）」「通過順（ハイフン区切りの数字）」「上がり3F（3F 〇〇.〇）」を慎重に視認し、見間違いがないか確認してから評価に移行してください。\n'
+            '3. 【馬番・馬名・騎手名の紐付け】：画像から「馬番」「馬名」「騎手名」を正しく読み取り、「〇番 馬名（騎手名）」の形式で必ず出力してください。読めない騎手名の捏造は厳禁です。\n'
+            '4. 【印と買い目の完全一致ルール】：『■ 3. おすすめの買い目』に含まれるすべての馬番は、必ず『■ 2. 印・期待度と推奨理由』の中に◎・◯・▲・☆・△（連下）のいずれかの印をつけて掲載してください。買い目にしか登場しない印なしの謎の馬番が存在することは絶対に禁止します。\n'
+            '5. オッズや人気順は一切考慮せず、出馬表の事実のみに基づく【条件合致度（100点満点）】を期待度（%）として絶対評価で算出してください。\n'
+            '6. 出力の最後の行には、省略せず必ず「※馬券購入は自己責任でお願いします」と記載してください。\n\n'
             '【★的中精度を上げる3つの追加ロジック（数字データの徹底活用）】\n'
             '①【着差による実力評価】：前走の着順が4着以下と悪くても、1着馬との着差（カッコ内の数字）が「0.5秒以内」であれば、実力拮抗とみなし大幅な減点はせず、展開次第で巻き返し可能として評価を上げること。\n'
             '②【上がり3F×コース形態】：過去3走以内で上がり3F「34秒台以下（3F 34.X）」を記録している馬は末脚が優秀である。東京・新潟外・阪神外など直線が長いコースではこれを大加点せよ。逆に札幌・函館など直線が短いコースでは、末脚不発のリスクを考慮し過信しないこと。\n'
@@ -227,8 +252,8 @@ def handle_image(event):
             '　・ダ1700m：最後までバテない「逃げ・先行馬」一択。\n'
             '◆札幌以外の場合は、コース形態からフラットに考察すること。\n\n'
             '【出力フォーマット】\n'
-            '※以下のレイアウトを厳守し、冒頭のレース情報には必ず【開催場・コース種別・距離】を明確に記載してください。\n\n'
-            '■ 1. レース概要：【〇〇 芝/ダ〇〇〇m】 [レースの堅実度：A〜C]\n'
+            '※以下のレイアウトを厳守し、冒頭のレース情報には必ず【開催場〇R コース種別・距離】（例: 【新潟11R 芝1200m】）を明確に記載してください。\n\n'
+            '■ 1. レース概要：【〇〇〇R 芝/ダ〇〇〇m】 [レースの堅実度：A〜C]\n'
             '（展開予想と馬場状態・コース形態の影響を記載。※追加ロジック③の通過順から読み取ったペース予想もここに含めること）\n\n'
             '■ 2. 印・期待度と推奨理由\n'
             '◎ 【本命】 〇番 馬名（騎手名） [期待度：〇% / 評価：S〜B]\n'
@@ -260,7 +285,6 @@ def handle_image(event):
             )
             if response and response.text:
               reply_text = response.text
-              # バックグラウンドでGASへ即時送信
               send_prediction_to_gas_async(reply_text)
               break
           except Exception as m_err:
@@ -275,7 +299,6 @@ def handle_image(event):
       logging.error(f'System error: {e}')
       reply_text = f'⚠️ システムエラーが発生しました: {str(e)}'
 
-    # LINEの文字数上限（5000文字）オーバー防止
     if reply_text and len(reply_text) > 4900:
       reply_text = reply_text[:4900] + '\n...(以下省略)'
 
