@@ -18,7 +18,7 @@ from linebot.v3.messaging import (
     TextMessage,
 )
 from linebot.v3.webhooks import ImageMessageContent, MessageEvent
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 import requests
 
 logging.basicConfig(level=logging.INFO)
@@ -41,11 +41,43 @@ processed_message_ids = set()
 
 
 def get_jst_today():
-  jst = datetime.timezone(datetime.timedelta(hours=9))
-  return datetime.datetime.now(jst).strftime('%Y-%m-%d')
+  """現在の日付（JST）を取得"""
+  try:
+    jst = datetime.timezone(datetime.timedelta(hours=9))
+    return datetime.datetime.now(jst).strftime('%Y-%m-%d')
+  except Exception as e:
+    logging.error(f'Date error: {e}')
+    return datetime.datetime.now().strftime('%Y-%m-%d')
+
+
+def process_image_for_ocr(image):
+  """
+  【画質補正＆最安コスト両立関数】
+  解像度を1280pxに最適化してトークン費用を最安に保ちつつ、
+  コントラストと輪郭を自動強調して遠目スクショの文字認識率を向上。
+  ※処理失敗時も元画像で安全フォールバック
+  """
+  try:
+    img_copy = image.copy()
+    # 1. 長辺1280pxにリサイズ（API最安・最高画質のバランス）
+    img_copy.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+
+    # 2. コントラスト強調（文字をくっきり黒く、背景を白く）
+    enhancer = ImageEnhance.Contrast(img_copy)
+    img_copy = enhancer.enhance(1.4)
+
+    # 3. くっきり化（ボヤけた小さな文字の輪郭補正）
+    img_copy = img_copy.filter(ImageFilter.SHARPEN)
+
+    return img_copy
+  except Exception as e:
+    logging.error(f'Image enhancement failed: {e}')
+    return image
 
 
 def send_prediction_to_gas_async(prediction_text):
+  """予想結果をGASへ非同期送信（エラー完全遮断）"""
+
   def _send():
     if not GAS_WEBAPP_URL:
       return
@@ -66,7 +98,7 @@ def send_prediction_to_gas_async(prediction_text):
 
 
 def fetch_accumulated_trends_from_gas():
-  """GASから蓄積された傾向データ（馬場・好走馬名・注意馬名）を取得する"""
+  """GASから7カテゴリーの傾向データを安全に取得（エラー時は空文字で完全保護）"""
   if not GAS_WEBAPP_URL:
     return ''
   try:
@@ -79,26 +111,28 @@ def fetch_accumulated_trends_from_gas():
     )
     if response.status_code == 200:
       res_json = response.json()
-      return res_json.get('trend_info', '')
+      if isinstance(res_json, dict):
+        return str(res_json.get('trend_info', ''))
   except Exception as e:
     logging.error(f'Failed to fetch trends: {e}')
   return ''
 
 
 def load_baba_data():
+  """記憶された馬場情報を読み込み（安全処理）"""
   if os.path.exists(BABA_FILE):
     try:
       with open(BABA_FILE, 'r', encoding='utf-8') as f:
         data = json.load(f)
-        if data.get('date') != get_jst_today():
-          return {}
-        return data.get('data', {})
+        if isinstance(data, dict) and data.get('date') == get_jst_today():
+          return data.get('data', {})
     except Exception as e:
       logging.error(f'Failed to load baba file: {e}')
   return {}
 
 
 def save_baba_data(baba_dict):
+  """馬場情報を安全に保存"""
   try:
     data_to_save = {'date': get_jst_today(), 'data': baba_dict}
     with open(BABA_FILE, 'w', encoding='utf-8') as f:
@@ -138,8 +172,10 @@ def handle_image(event):
     try:
       blob_api = MessagingApiBlob(api_client)
       image_bytes = blob_api.get_message_content(message_id=msg_id)
-      image = Image.open(io.BytesIO(image_bytes))
-      image.thumbnail((2048, 2048))
+      raw_image = Image.open(io.BytesIO(image_bytes))
+
+      # ★文字認識率向上＆コスト最適化の画像補正処理
+      processed_image = process_image_for_ocr(raw_image)
 
       candidate_models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash']
       deterministic_config = types.GenerateContentConfig(temperature=0.0)
@@ -155,13 +191,16 @@ def handle_image(event):
       for model_name in candidate_models:
         try:
           res = ai_client.models.generate_content(
-              model=model_name, contents=[image, classify_prompt], config=deterministic_config
+              model=model_name,
+              contents=[processed_image, classify_prompt],
+              config=deterministic_config,
           )
           if res and res.text:
-            if 'BABA' in res.text.strip().upper():
+            if 'BABA' in str(res.text).strip().upper():
               image_type = 'BABA'
             break
-        except Exception:
+        except Exception as c_err:
+          logging.warning(f'Classify attempt [{model_name}] error: {c_err}')
           continue
 
       if image_type == 'BABA':
@@ -175,22 +214,30 @@ def handle_image(event):
         for model_name in candidate_models:
           try:
             res = ai_client.models.generate_content(
-                model=model_name, contents=[image, extract_prompt], config=deterministic_config
+                model=model_name,
+                contents=[processed_image, extract_prompt],
+                config=deterministic_config,
             )
             if res and res.text:
-              raw_text = res.text.replace('```json', '').replace('```', '').strip()
+              raw_text = (
+                  str(res.text)
+                  .replace('```json', '')
+                  .replace('```', '')
+                  .strip()
+              )
               baba_json = json.loads(raw_text)
               break
-          except Exception:
+          except Exception as b_err:
+            logging.warning(f'Baba extract [{model_name}] error: {b_err}')
             continue
 
-        if baba_json and 'keibajo' in baba_json:
+        if isinstance(baba_json, dict) and 'keibajo' in baba_json:
           current_data = load_baba_data()
-          keibajo = baba_json['keibajo']
+          keibajo = str(baba_json.get('keibajo', '不明'))
           current_data[keibajo] = {
-              'tenko': baba_json.get('tenko', '不明'),
-              'shiba': baba_json.get('shiba', '不明'),
-              'dirt': baba_json.get('dirt', '不明'),
+              'tenko': str(baba_json.get('tenko', '不明')),
+              'shiba': str(baba_json.get('shiba', '不明')),
+              'dirt': str(baba_json.get('dirt', '不明')),
           }
           save_baba_data(current_data)
 
@@ -201,51 +248,58 @@ def handle_image(event):
               f'🌿 芝：{baba_json.get("shiba", "不明")}\n'
               f'🟫 ダート：{baba_json.get("dirt", "不明")}\n\n'
               '※日付が変わると自動でリセットされます。\n'
-              '※本日この競馬場の出馬表が送られた際、血統適性や有利な脚質に自動反映します！'
+              '※本日この競馬場の出馬表が送られた際、自動反映して深層予想を行います！'
           )
         else:
           reply_text = '⚠️ 馬場情報の読み取りに失敗しました。もう一度はっきり映った画像を送信してください。'
 
       else:
         baba_data = load_baba_data()
-        baba_context_str = '【現在システムに記憶されている本日の競馬場別リアルタイム馬場情報】\n'
-        if baba_data:
+        baba_context_str = (
+            '【現在システムに記憶されている本日の競馬場別リアルタイム馬場情報】\n'
+        )
+        if baba_data and isinstance(baba_data, dict):
           for k, v in baba_data.items():
-            baba_context_str += f'・[{k}競馬場] ➔ 天候:{v.get("tenko")} / 芝:{v.get("shiba")} / ダート:{v.get("dirt")}\n'
-          baba_context_str += '※【超厳格指示】必ず出馬表画像から解析した「開催競馬場名」と100%名称が合致するデータ『のみ』を参照してください。合致するデータがない場合は標準の「良馬場」として判定してください。\n\n'
+            if isinstance(v, dict):
+              baba_context_str += f'・[{k}競馬場] ➔ 天候:{v.get("tenko", "不明")} / 芝:{v.get("shiba", "不明")} / ダート:{v.get("dirt", "不明")}\n'
+          baba_context_str += '※【厳格指示】必ず出馬表から解析した「競馬場名」と一致するデータのみを参照してください。ない場合は標準の「良馬場」として判定してください。\n\n'
         else:
-          baba_context_str += '・登録なし（馬場情報画像未送信のため標準の「良馬場」として判定）\n\n'
+          baba_context_str += (
+              '・登録なし（馬場情報未送信のため標準の「良馬場」として判定）\n\n'
+          )
 
-        # GASから蓄積された傾向・馬名データの読み出し
+        # ★GASから7カテゴリーの深層傾向データを取得
         accumulated_trends = fetch_accumulated_trends_from_gas()
         trend_context_str = ''
         if accumulated_trends:
           trend_context_str = (
-              '【システムが記憶している過去のレース結果・学習データ】\n'
+              '【システムが記憶している過去の7カテゴリー学習傾向データ】\n'
               + accumulated_trends
-              + '\n※【重要指示】：上記データに記載されている「2・3着好走・巻き返し注意馬（馬名）」が出走馬に含まれる場合、前走の着順に関わらず評価を上げて高評価（軸・相手候補）として加点してください。\n\n'
+              + '\n※【重要多重指示】：\n'
+              ' 1. 「注意馬（馬名）」が出走馬に含まれる場合、前走着順に関わらず評価を大幅加点（軸・相手昇格）すること。\n'
+              ' 2. 「トラックバイアス」「馬場・ペース傾向」の条件に合致する脚質・枠順の馬を加点すること。\n'
+              ' 3. 「消し条件」に合致する危険な人気馬は評価を下げるか買い目から外すこと。\n\n'
           )
 
         prompt = (
             '送られた画像（出馬表など）を解析し、まずは【開催競馬場・何レース目か（〇R）】と【距離・馬場】を正確に特定してください。\n\n'
             + baba_context_str
             + trend_context_str
-            + '【絶対厳守事項：ハルシネーション禁止 ＆ 人気・オッズ完全無視】\n'
-            '1. 【レース番号の絶対抽出】：冒頭のタイトル【〇〇 芝/ダ〇〇〇m】には、必ず「開催場」と「何レース目か（例: 11R）」をセットで『【新潟11R 芝1200m】』のように明確に記載してください。レース番号を省略することは絶対に禁止します。\n'
-            '2. 【数字の超厳格読み取り】：文字認識の精度を上げるため、予想を始める前に必ず画像内の過去成績にある「着差（カッコ内の数字）」「通過順（ハイフン区切りの数字）」「上がり3F（3F 〇〇.〇）」を慎重に視認し、見間違いがないか確認してから評価に移行してください。\n'
-            '3. 【馬番・馬名・騎手名の紐付け】：画像から「馬番」「馬名」「騎手名」を正しく読み取り、「〇番 馬名（騎手名）」の形式で必ず出力してください。読めない騎手名の捏造は厳禁です。\n'
-            '4. 【印と買い目の完全一致ルール】：『■ 3. おすすめの買い目』に含まれるすべての馬番は、必ず『■ 2. 印・期待度と推奨理由』の中に◎・◯・▲・☆・△（連下）のいずれかの印をつけて掲載してください。買い目にしか登場しない印なしの謎の馬番が存在することは絶対に禁止します。\n'
-            '5. 【★地方競馬実績の絶対割引ルール】：画像内の過去成績・経歴から「地方競馬（大井・川崎・船橋・浦和・園田・門別等）」での出走・好走実績が認められる場合、中央競馬（JRA）とは時計・ラップ・メンバーレベルの壁（クラスの差）が大きいため、地方での連勝や好走実績を過大評価せず、必ず割り引いて評価（期待度％を下げて慎重評価）してください。\n'
-            '6. オッズや人気順は一切考慮せず、出馬表の事実のみに基づく【条件合致度（100点満点）】を期待度（%）として絶対評価で算出してください。\n'
-            '7. 出力の最後の行には、省略せず必ず「※馬券購入は自己責任でお願いします」と記載してください。\n\n'
-            '【★的中精度を上げる3つの追加ロジック（数字データの徹底活用）】\n'
-            '①【着差による実力評価】：前走の着順が4着以下と悪くても、1着馬との着差（カッコ内の数字）が「0.5秒以内」であれば、実力拮抗とみなし大幅な減点はせず、展開次第で巻き返し可能として評価を上げること。\n'
-            '②【上がり3F×コース形態】：過去3走以内で上がり3F「34秒台以下（3F 34.X）」を記録している馬は末脚が優秀である。東京・新潟外・阪神外など直線が長いコースではこれを大加点せよ。逆に札幌・函館など直線が短いコースでは、末脚不発のリスクを考慮し過信しないこと。\n'
-            '③【通過順によるペース判定】：過去成績の「通過順（例: 2-2-2-2）」の最初の数字を確認せよ。出走馬の中で「1」や「2」が少なく、特定の馬だけが常に前に行けている場合、「単騎逃げ・先行有利なスローペース展開」と判定し、その先行馬を高く評価すること。\n\n'
-            '【全競馬場共通・基本チェックリスト】\n'
-            '・ダート戦×枠順：ダート戦で内枠（1〜3枠）を高評価にするのは「逃げ・先行馬」限定。出足が遅い内枠の馬は砂被りリスクとして割引。\n'
-            '・前走からの変動要素：斤量の大幅減は加点、極端な距離延長・短縮は慎重評価。\n'
-            '・騎手と厩舎：減量記号（▲等）の恩恵、継続騎乗などを加点。\n\n'
+            + '【絶対厳守事項：ハルシネーション禁止 ＆ 超厳格数字読み取り】\n'
+            '1. 【レース番号の絶対抽出】：冒頭のタイトル【〇〇 芝/ダ〇〇〇m】には、必ず「開催場」と「何レース目か（例: 11R）」をセットで『【新潟11R 芝1200m】』のように明確に記載してください。レース番号の省略は絶対禁止です。\n'
+            '2. 【数字と文字の精密読み取り】：画像内の「馬番」「馬名」「騎手名」「着差（カッコ内数値）」「通過順（ハイフン区切り）」「上がり3F（3F 〇〇.〇）」を慎重に視認してください。\n'
+            '3. 【印と買い目の完全一致ルール】：『■ 3. おすすめの買い目』に含まれるすべての馬番は、必ず『■ 2. 印・期待度と推奨理由』の中に◎・◯・▲・☆・△（連下）のいずれかの印をつけて掲載してください。買い目にしか登場しない印なしの馬番は存在禁止です。\n'
+            '4. 出力の最後の行には、省略せず必ず「※馬券購入は自己責任でお願いします」と記載してください。\n\n'
+            '【★的中精度＆回収率を跳ね上げる深層解析ロジック】\n'
+            '①【着差と前走クラスの評価】：前走4着以下でも1着との着差が「0.5秒以内」なら展開次第で巻き返し可能として加点。また前走のクラス（昇級初戦か、降級・クラス慣れか）も考慮すること。\n'
+            '②【上がり3F×コース適性】：過去3走以内に上がり3F「34秒台以下（3F 34.X）」を持つ馬は、東京・新潟など直線が長いコースで大加点。\n'
+            '③【通過順による展開・ペース判定】：過去成績の「通過順」を見て、逃げ・先行馬が少ない場合は単騎逃げスローペースと判定し先行馬を高く評価すること。\n'
+            '④【7カテゴリー傾向データの連動】：GAS傾向データの「注意馬」「バイアス」「消し条件」に該当する馬をスコア補正すること。\n\n'
+            '【★点数を増やすことなく回収率を最大化する「柔軟な買い目選定ルール」】\n'
+            'レースの「堅実度（A〜C）」および展開に応じて、以下のルールで最高効率の買い目（総点数10点以内）を選定・構成してください。\n'
+            '・【堅実度A（軸堅い / 本命◎の信頼度高）】：3連単1着固定フォーメーション（1着:◎ / 2着:◯▲ / 3着:◯▲☆△【計6点程度】）または 馬単（◎→◯▲☆【計3点程度】）を選定。\n'
+            '・【堅実度B（標準）】：3連複フォーメーション（1-2-4など【計5点程度】）または 馬連流し（◎→◯▲☆△【計4点程度】）を選定。\n'
+            '・【堅実度C（波乱・混戦 / 穴馬☆の妙味大）】：ワイド（◎−☆、または☆→◯▲【計2〜3点】）または 3連複穴軸（☆→◎◯→◎◯▲△【計6点程度】）を選定。\n\n'
             '【条件分岐ルール】\n'
             '◆開催競馬場が「札幌」の場合のみ、以下のルールを最優先すること。\n'
             '　・芝1200m：「1枠・最内」先行馬重視。\n'
@@ -253,12 +307,12 @@ def handle_image(event):
             '　・ダ1700m：最後までバテない「逃げ・先行馬」一択。\n'
             '◆札幌以外の場合は、コース形態からフラットに考察すること。\n\n'
             '【出力フォーマット】\n'
-            '※以下のレイアウトを厳守し、冒頭のレース情報には必ず【開催場〇R コース種別・距離】（例: 【新潟11R 芝1200m】）を明確に記載してください。\n\n'
+            '※以下のレイアウトを絶対に厳守し、1文字もレイアウトを崩さず出力してください。\n\n'
             '■ 1. レース概要：【〇〇〇R 芝/ダ〇〇〇m】 [レースの堅実度：A〜C]\n'
-            '（展開予想と馬場状態・コース形態の影響を記載。※追加ロジック③の通過順から読み取ったペース予想もここに含めること）\n\n'
+            '（展開予想と馬場状態・コース形態の影響を記載。通過順から読み取ったペース予想もここに含めること）\n\n'
             '■ 2. 印・期待度と推奨理由\n'
             '◎ 【本命】 〇番 馬名（騎手名） [期待度：〇% / 評価：S〜B]\n'
-            '（理由を1〜2文程度で。※追加ロジック①の着差、②の3Fタイムなどを具体的に根拠として含めること）\n\n'
+            '（理由を1〜2文程度で。着差、3Fタイムなどの具体数値を根拠に含めること）\n\n'
             '◯ 【対抗】 〇番 馬名（騎手名） [期待度：〇% / 評価：S〜B]\n'
             '（理由を1〜2文程度で）\n\n'
             '▲ 【単穴】 〇番 馬名（騎手名） [期待度：〇% / 評価：S〜B]\n'
@@ -266,15 +320,12 @@ def handle_image(event):
             '☆ 【穴馬】 〇番 馬名（騎手名） [期待度：〇% / 評価：S〜B]\n'
             '（理由を1〜2文程度で）\n\n'
             '△ 【連下】 〇番 馬名（騎手名） [期待度：〇% / 評価：B〜C]\n'
-            '（理由を1文程度で。※買い目（相手や3列目など）に含める馬を漏れなく1〜3頭程度記載すること）\n\n'
+            '（理由を1文程度で。買い目に含める馬を漏れなく1〜3頭程度記載すること）\n\n'
             '■ 3. おすすめの買い目\n'
-            '【選定券種（例：馬連・馬単 など）】\n'
-            '軸馬：〇\n'
-            '相手：〇, 〇, 〇\n\n'
-            '【選定券種（例：3連複フォーメーション など）】\n'
-            '1列目（または1着）：〇\n'
-            '2列目（または2着）：〇, 〇\n'
-            '3列目（または3着）：〇, 〇, 〇, 〇\n\n'
+            '【選定券種（堅実度に応じて3連単・ワイド・3連複・馬連・馬単等から1〜2種選定）】\n'
+            '軸馬（または1着/1列目）：〇\n'
+            '相手（または2着/2列目）：〇, 〇\n'
+            '相手（または3着/3列目）：〇, 〇, 〇, 〇\n\n'
             '※馬券購入は自己責任でお願いします'
         )
 
@@ -282,10 +333,12 @@ def handle_image(event):
         for model_name in candidate_models:
           try:
             response = ai_client.models.generate_content(
-                model=model_name, contents=[image, prompt], config=deterministic_config
+                model=model_name,
+                contents=[processed_image, prompt],
+                config=deterministic_config,
             )
             if response and response.text:
-              reply_text = response.text
+              reply_text = str(response.text)
               send_prediction_to_gas_async(reply_text)
               break
           except Exception as m_err:
@@ -294,12 +347,13 @@ def handle_image(event):
 
         if not reply_text:
           err_str = ' / '.join(error_logs)
-          reply_text = f'⚠️ AIサーバーでエラーが発生しました。\n詳細: {err_str}'
+          reply_text = f'⚠️ AIサーバーで一時的なエラーが発生しました。\n詳細: {err_str}'
 
     except Exception as e:
       logging.error(f'System error: {e}')
       reply_text = f'⚠️ システムエラーが発生しました: {str(e)}'
 
+    # LINE送信文字数上限（5,000文字）セーフティカット
     if reply_text and len(reply_text) > 4900:
       reply_text = reply_text[:4900] + '\n...(以下省略)'
 
