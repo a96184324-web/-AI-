@@ -36,18 +36,15 @@ configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# 永続保存ファイル（Pythonスリープ対策）
 BABA_FILE = 'baba_info.json'
 RACE_LIST_FILE = 'race_list_info.json'
 
 processed_message_ids = set()
 
-# 出馬表（2枚同時送信時）の合体用バッファ
 image_buffer = []
 buffer_lock = threading.Lock()
 
 def get_jst_today():
-    """現在の日付（JST）を取得"""
     try:
         jst = datetime.timezone(datetime.timedelta(hours=9))
         return datetime.datetime.now(jst).strftime('%Y-%m-%d')
@@ -56,7 +53,6 @@ def get_jst_today():
         return datetime.datetime.now().strftime('%Y-%m-%d')
 
 def process_image_for_ocr(image):
-    """【画質補正＆最安コスト両立関数】"""
     try:
         img_copy = image.copy()
         img_copy.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
@@ -69,7 +65,6 @@ def process_image_for_ocr(image):
         return image
 
 def send_to_gas_async(action, payload_data):
-    """GASへ非同期送信（エラー完全遮断）"""
     def _send():
         if not GAS_WEBAPP_URL:
             return
@@ -93,7 +88,6 @@ def send_to_gas_async(action, payload_data):
     thread.start()
 
 def load_json_file(filepath):
-    """ローカル保存データの安全ロード"""
     if os.path.exists(filepath):
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
@@ -105,7 +99,6 @@ def load_json_file(filepath):
     return {}
 
 def save_json_file(filepath, dict_data):
-    """ローカル保存データの安全セーブ"""
     try:
         data_to_save = {
             'date': get_jst_today(),
@@ -128,9 +121,6 @@ def callback():
         logging.error(f"Error handling webhook: {e}")
     return 'OK'
 
-# ==========================================
-# 1. 【結果テキスト一括受信ハンドラー】
-# ==========================================
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text(event):
     msg_id = event.message.id
@@ -142,9 +132,7 @@ def handle_text(event):
 
     user_text = event.message.text
     
-    # 結果テキストの判定（「着順」「ハロンタイム」「払戻」等が含まれているか）
     if any(k in user_text for k in ["着順", "ハロンタイム", "単勝", "複勝", "コーナー通過順位"]):
-        # 1. 前処理：無駄な雑文（オッズ、注意書き等）のカット
         cleaned_lines = []
         skip_keywords = ["JRAプラス10", "特払い", "勝馬の紹介", "印刷用ページ", "レース映像", "全周パトロール"]
         for line in user_text.splitlines():
@@ -152,9 +140,7 @@ def handle_text(event):
                 cleaned_lines.append(line)
         cleaned_text = "\n".join(cleaned_lines)
 
-        # 2. GASへ一次データとして一括送出（GAS側で1Rずつ安全分割・保存）
         send_to_gas_async('save_race_results', cleaned_text)
-
         reply_text = (
             "【結果テキストを一括取り込みました】\n"
             "雑文を自動カットし、GASデータベースへ数値を保存しました。\n"
@@ -172,9 +158,6 @@ def handle_text(event):
             )
         )
 
-# ==========================================
-# 2. 【画像送信ハンドラー（3分岐＋合体処理）】
-# ==========================================
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image(event):
     msg_id = event.message.id
@@ -196,7 +179,6 @@ def handle_image(event):
             candidate_models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash']
             deterministic_config = types.GenerateContentConfig(temperature=0.0)
 
-            # 【画像3分岐判定プロンプト】
             classify_prompt = (
                 "送られた画像を判定してください。\n"
                 "・1R〜12Rなどの『全レース一覧・コース距離表』の画面であれば \"LIST\" と答えてください。\n"
@@ -224,13 +206,10 @@ def handle_image(event):
                     logging.warning(f"Classify attempt [{model_name}] error: {c_err}")
                     continue
 
-            # --------------------------------------------------
-            # パターン①：全レース一覧画像 (LIST)
-            # --------------------------------------------------
             if image_type == 'LIST':
                 extract_list_prompt = (
                     "この画像から【開催競馬場名】と【各レース(1R〜12R)のコース・距離・条件】を抽出し、以下のJSON形式のみで出力してください。\n"
-                    "{\"keibajo\": \"札幌\", \"races\": {\"1R\": \"ダ1700m\", \"2R\": \"芝1200m\", ...}}\n"
+                    "{\"keibajo\": \"札幌\", \"races\": {\"1R\": \"ダ1700m\", \"2R\": \"芝1200m\"}}\n"
                     "※JSON以外の文字列は含めないでください。"
                 )
                 list_json = None
@@ -256,21 +235,18 @@ def handle_image(event):
                     save_json_file(RACE_LIST_FILE, current_list)
                     send_to_gas_async('save_race_list', list_json)
 
-                    reply_text = f"【本日の{keibajo}競馬場 全レース一覧・距離情報を記憶しました】\n出馬表が送られた際、コース条件を自動照合します！"
+                    reply_text = f"【本日の{keibajo}競馬場 全レース一覧・距離情報を記憶しました】"
                 else:
-                    reply_text = "⚠️ 全レース一覧の読み取りに失敗しました。もう一度はっきり映った画像を送信してください。"
+                    reply_text = "⚠️ 全レース一覧の読み取りに失敗しました。もう一度送信してください。"
 
                 messaging_api.reply_message(
                     ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
                 )
 
-            # --------------------------------------------------
-            # パターン②：馬場状態画像 (BABA)
-            # --------------------------------------------------
             elif image_type == 'BABA':
                 extract_baba_prompt = (
                     "この馬場情報画像から【競馬場名】、【天候】、【芝の馬場状態】、【ダートの馬場状態】を抽出し、以下のJSON形式のみで出力してください。\n"
-                    "{\"keibajo\": \"札幌\", \"tenko\": "晴", \"shiba\": \"良\", \"dirt\": \"良\"}\n"
+                    "{\"keibajo\": \"札幌\", \"tenko\": \"晴\", \"shiba\": \"良\", \"dirt\": \"良\"}\n"
                     "※JSON以外の文字列は含めないでください。"
                 )
                 baba_json = None
@@ -314,18 +290,13 @@ def handle_image(event):
                     ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
                 )
 
-            # --------------------------------------------------
-            # パターン③：出馬表画像 (RACE) ➔ 2枚同時送信の合体解析
-            # --------------------------------------------------
             else:
                 with buffer_lock:
                     image_buffer.append(processed_image)
 
-                # 2枚目が送られてくるか少し待機（同時送信バッファリング）
                 def process_race_prediction(reply_token, imgs):
                     baba_data = load_json_file(BABA_FILE)
-                    list_data = load_json_file(RACE_LIST_FILE)
-
+                    
                     baba_context_str = "【記憶されている本日のリアルタイム馬場情報】\n"
                     if baba_data:
                         for k, v in baba_data.items():
@@ -335,15 +306,15 @@ def handle_image(event):
 
                     prompt = (
                         "送られた1枚または2枚の出馬表画像を解析してください。\n"
-                        "※2枚の画像で中央付近の馬（馬番）が重複して映っている場合は、馬番（1番、2番...）を基準にしてダブりを自動削除し、全頭1つに結合して解析してください。\n\n"
+                        "※2枚の画像で中央付近の馬（馬番）が重複して映っている場合は、馬番を基準にしてダブりを自動削除し、全頭1つに結合して解析してください。\n\n"
                         + baba_context_str + "\n"
                         "【絶対厳守ルール】\n"
                         "1. タイトル表記：冒頭は必ず『【札幌1R ダ1700m】』のように競馬場・レース番号・距離条件を完全に明記すること。\n"
                         "2. 馬番認識：画像内の馬番・馬名・負担重量・騎手・前走着順・通過順を正確に読み取ること。\n"
-                        "3. 買い目整合性：『■ 3. おすすめの買い目』の馬番は、必ず『■ 2. 印・期待度と推奨理由』の◎◯▲☆△の印付き馬と完全一致させること。\n"
+                        "3. 買い目整合性：『■ 3. おすすめの買い目』の馬番は、必ず『■ 2. 印・期待度と推奨理由』の印付き馬と完全一致させること。\n"
                         "4. 過去の抽象傾向データの参照は禁止。出馬表の純粋数値のみで判定すること。\n\n"
                         "【新・激走穴馬（☆）抜擢ロジック】\n"
-                        "人気や前走の表面的な二桁着順を完全に無視し、以下の数値トリガーを満たす伏兵馬を必ず☆（穴馬）または上位印（◎・◯）に抜擢すること。\n"
+                        "人気や前走の着順を完全に無視し、以下の数値トリガーを満たす伏兵馬を必ず☆（穴馬）または上位印に抜擢すること。\n"
                         "・前走不向きな展開（前残り馬場で後方から上がり上位を使って惨敗等）からの巻き返し\n"
                         "・今回大幅な斤量減（-2kg〜-4kg）または馬体重増減の改善\n"
                         "・前走と異なるトラックバイアス・距離変更での一変\n\n"
@@ -352,11 +323,9 @@ def handle_image(event):
                         "（展開・馬場・ペースの分析）\n\n"
                         "■ 2. 印・期待度と推奨理由\n"
                         "◎ 【本命】 〇番 馬名（騎手名） [期待度：〇% / 評価：S〜B]\n"
-                        "（具体的数値根拠を含む理由）\n"
                         "◯ 【対抗】 〇番 馬名（騎手名） [期待度：〇% / 評価：S〜B]\n"
                         "▲ 【単穴】 〇番 馬名（騎手名） [期待度：〇% / 評価：S〜B]\n"
                         "☆ 【穴馬】 〇番 馬名（騎手名） [期待度：〇% / 評価：S〜B]\n"
-                        "（新・激走穴馬の変身理由を明確に記載）\n"
                         "△ 【連下】 〇番 馬名（騎手名） [期待度：〇% / 評価：B〜C]\n\n"
                         "■ 3. おすすめの買い目\n"
                         "【選定券種】\n"
@@ -383,7 +352,7 @@ def handle_image(event):
                             continue
 
                     if not reply_text:
-                        reply_text = "⚠️ 出馬表の読み取り・予想作成に失敗しました。画像が鮮明か確認して再送してください。"
+                        reply_text = "⚠️ 出馬表の読み取り・予想作成に失敗しました。もう一度送信してください。"
 
                     if len(reply_text) > 4900:
                         reply_text = reply_text[:4900] + "\n...(以下省略)"
@@ -394,7 +363,6 @@ def handle_image(event):
                             ReplyMessageRequest(reply_token=reply_token, messages=[TextMessage(text=reply_text)])
                         )
 
-                # 0.8秒待って次の画像がバッファに来なければ処理開始（2枚同時送信対応）
                 def timer_callback():
                     with buffer_lock:
                         imgs_to_process = list(image_buffer)
