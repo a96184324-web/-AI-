@@ -43,6 +43,8 @@ processed_message_ids = set()
 
 image_buffer = []
 buffer_lock = threading.Lock()
+current_timer = None
+latest_reply_token = None  # 最新の返信トークンを保持
 
 # JRA全10場 コース区分マスターテーブル
 COURSE_MASTER = {
@@ -102,7 +104,6 @@ def send_to_gas_async(action, payload_data):
     thread.start()
 
 def fetch_past_results_from_gas(keibajo="", track_type="", distance=""):
-    """【競馬場・種別（芝/ダ）・距離】が完全一致するスプレッドシート過去データだけをピンポイント取得"""
     if not GAS_WEBAPP_URL:
         return ""
     try:
@@ -127,7 +128,6 @@ def fetch_past_results_from_gas(keibajo="", track_type="", distance=""):
     return ""
 
 def get_course_info(keibajo, kai, nichi):
-    """マスターテーブルからA/Bコースと使用日数を取得"""
     try:
         kai_str = f"{kai}回"
         nichi_num = int(nichi)
@@ -199,6 +199,7 @@ def handle_text(event):
 
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image(event):
+    global current_timer, latest_reply_token
     msg_id = event.message.id
     if msg_id in processed_message_ids:
         return
@@ -337,18 +338,29 @@ def handle_image(event):
                 )
 
             else:
+                # 出馬表（RACE）の画像をバッファへ追加（スレッドセーフ）
                 with buffer_lock:
                     image_buffer.append(processed_image)
+                    latest_reply_token = event.reply_token  # 常に最新のトークンを更新
 
-                def process_race_prediction(reply_token, imgs):
+                def process_race_prediction():
+                    global latest_reply_token
+                    with buffer_lock:
+                        imgs = list(image_buffer)
+                        image_buffer.clear()
+                        r_token = latest_reply_token
+
+                    if not imgs or not r_token:
+                        return
+
                     baba_data = load_json_file(BABA_FILE)
                     list_data = load_json_file(RACE_LIST_FILE)
 
-                    # 出馬表画像から【競馬場・種別（芝/ダート）・距離】を判定
+                    # 1枚目の画像から競馬場・トラック・距離を取得
                     race_info_prompt = (
                         "画像の上部ヘッダーやタイトルから【競馬場名】、【コース種別（芝またはダート）】、【距離（数字のみ）】を読み取り、\n"
                         "以下のJSON形式のみで出力してください。\n"
-                        "{\"keibajo\": \"札幌\", \"track_type\": \"ダート\", \"distance\": \"1700\"}\n"
+                        "{\"keibajo\": \"中京\", \"track_type\": \"ダート\", \"distance\": \"1800\"}\n"
                         "※JSON以外出力禁止。"
                     )
                     keibajo_name, track_type, distance_num = "", "", ""
@@ -377,7 +389,6 @@ def handle_image(event):
                     else:
                         baba_context_str += "・未設定（標準の良馬場として判定）\n"
 
-                    # スプレッドシートから【同競馬場・同種別・同距離】が完全一致する過去データのみピンポイント取得
                     past_results_str = fetch_past_results_from_gas(keibajo_name, track_type, distance_num)
                     past_data_context = ""
                     if past_results_str:
@@ -390,12 +401,13 @@ def handle_image(event):
 
                     prompt = (
                         "送られた1枚または2枚の出馬表画像を解析してください。\n"
-                        "※2枚の画像で中央付近の馬（馬番）が重複して映っている場合は、馬番を基準にしてダブりを自動削除し、全頭1つに結合して解析してください。\n\n"
+                        "※2枚の画像が送られた場合は、必ず1枚目の出走馬（1番〜）と2枚目の出走馬（続きの馬番〜全頭）を1つの出馬表として統合・結合し、全ての馬（1番から最終馬番まで）を漏れなく評価対象にしてください。\n"
+                        "※2枚の画像で中央付近の馬（馬番）が重複して映っている場合は、馬番を基準にしてダブりを自動削除して全頭1つに結合してください。\n\n"
                         + baba_context_str
                         + past_data_context + "\n"
                         "【絶対厳守ルール】\n"
-                        "1. タイトル表記：冒頭は必ず『【札幌1R ダ1700m】』のように競馬場・レース番号・距離条件を完全に明記すること。\n"
-                        "2. 馬番認識：画像内の馬番・馬名・負担重量・騎手・前走着順・通過順を正確に読み取ること。\n"
+                        "1. タイトル表記：冒頭は必ず『【中京1R ダ1800m】』のように競馬場・レース番号・距離条件を完全に明記すること。\n"
+                        "2. 馬番認識：画像内の1番から最終馬番までの馬番・馬名・負担重量・騎手・前走着順・通過順を正確に読み取ること。\n"
                         "3. 買い目整合性：『■ 3. おすすめの買い目』の馬番は、必ず『■ 2. 印・期待度と推奨理由』の印付き馬と完全一致させること。\n"
                         "4. 過去データの照合：スプレッドシートの同条件過去データから勝ちタイム水準・上がり時計・直近の通過順傾向を参照し、今回の出走馬の数値と客観的に比較して根拠に組み込むこと。\n\n"
                         "【新・激走穴馬（☆）抜擢ロジック】\n"
@@ -446,18 +458,15 @@ def handle_image(event):
                     with ApiClient(configuration) as api_client_inner:
                         m_api = MessagingApi(api_client_inner)
                         m_api.reply_message(
-                            ReplyMessageRequest(reply_token=reply_token, messages=[TextMessage(text=reply_text)])
+                            ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)])
                         )
 
-                def timer_callback():
-                    with buffer_lock:
-                        imgs_to_process = list(image_buffer)
-                        image_buffer.clear()
-                    if imgs_to_process:
-                        process_race_prediction(event.reply_token, imgs_to_process)
+                # 同時送信された画像が全てバッファに溜まり切るまでタイマーをリセットしながら待機（1.5秒）
+                if current_timer is not None:
+                    current_timer.cancel()
 
-                timer = threading.Timer(0.8, timer_callback)
-                timer.start()
+                current_timer = threading.Timer(1.5, process_race_prediction)
+                current_timer.start()
 
         except Exception as e:
             logging.error(f"System error: {e}")
