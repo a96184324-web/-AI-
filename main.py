@@ -44,9 +44,8 @@ processed_message_ids = set()
 image_buffer = []
 buffer_lock = threading.Lock()
 current_timer = None
-latest_reply_token = None  # 最新の返信トークンを保持
+latest_reply_token = None
 
-# JRA全10場 コース区分マスターテーブル
 COURSE_MASTER = {
     "札幌": {"1回": {"A": range(1, 7)}, "2回": {"B": range(1, 7)}},
     "函館": {"1回": {"A": range(1, 7), "B": range(7, 13)}},
@@ -179,7 +178,7 @@ def handle_text(event):
     if msg_id in processed_message_ids:
         return
     processed_message_ids.add(msg_id)
-    if len(processed_message_ids) > 100:
+    if len(processed_message_ids) > 200:
         processed_message_ids.clear()
 
     reply_text = (
@@ -201,272 +200,272 @@ def handle_text(event):
 def handle_image(event):
     global current_timer, latest_reply_token
     msg_id = event.message.id
+
     if msg_id in processed_message_ids:
         return
     processed_message_ids.add(msg_id)
-    if len(processed_message_ids) > 100:
+    if len(processed_message_ids) > 200:
         processed_message_ids.clear()
 
     with ApiClient(configuration) as api_client:
-        messaging_api = MessagingApi(api_client)
-
         try:
             blob_api = MessagingApiBlob(api_client)
             image_bytes = blob_api.get_message_content(message_id=msg_id)
             raw_image = Image.open(io.BytesIO(image_bytes))
             processed_image = process_image_for_ocr(raw_image)
 
-            candidate_models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash']
-            deterministic_config = types.GenerateContentConfig(temperature=0.0)
+            # ★最重要修正：画像の判定を待たず、届いた瞬間に即時バッファへ追加（分割事故を完全に防ぐ）
+            with buffer_lock:
+                image_buffer.append(processed_image)
+                latest_reply_token = event.reply_token
 
-            classify_prompt = (
-                "送られた画像を判定してください。\n"
-                "・1R〜12Rなどの『全レース一覧・コース距離表』の画面であれば \"LIST\" と答えてください。\n"
-                "・『馬場情報（天候、芝・ダートの馬場状態）』の画面であれば \"BABA\" と答えてください。\n"
-                "・それ以外の『出馬表（馬名やオッズが並ぶ画面）』であれば \"RACE\" と答えてください。\n"
-                "回答は \"LIST\"、\"BABA\"、\"RACE\" の英字1単語のみにしてください。"
-            )
-
-            image_type = 'RACE'
-            for model_name in candidate_models:
-                try:
-                    res = ai_client.models.generate_content(
-                        model=model_name,
-                        contents=[processed_image, classify_prompt],
-                        config=deterministic_config
-                    )
-                    if res and res.text:
-                        text_upper = str(res.text).strip().upper()
-                        if 'LIST' in text_upper:
-                            image_type = 'LIST'
-                        elif 'BABA' in text_upper:
-                            image_type = 'BABA'
-                        break
-                except Exception as c_err:
-                    logging.warning(f"Classify attempt [{model_name}] error: {c_err}")
-                    continue
-
-            if image_type == 'LIST':
-                extract_list_prompt = (
-                    "この画像から【開催競馬場名】と【各レース(1R〜12R)のコース・距離・条件】、【開催節情報（例：1回札幌4日）】を抽出し、以下のJSON形式のみで出力してください。\n"
-                    "{\"keibajo\": \"札幌\", \"kai\": \"1\", \"nichi\": \"4\", \"races\": {\"1R\": \"ダ1700m\", \"2R\": \"芝1200m\"}}\n"
-                    "※JSON以外の文字列は含めないでください。"
-                )
-                list_json = None
-                for model_name in candidate_models:
-                    try:
-                        res = ai_client.models.generate_content(
-                            model=model_name,
-                            contents=[processed_image, extract_list_prompt],
-                            config=deterministic_config
-                        )
-                        if res and res.text:
-                            raw_text = str(res.text).replace('```json', '').replace('```', '').strip()
-                            list_json = json.loads(raw_text)
-                            break
-                    except Exception as l_err:
-                        logging.warning(f"List extract [{model_name}] error: {l_err}")
-                        continue
-
-                if isinstance(list_json, dict) and 'keibajo' in list_json:
-                    keibajo = list_json.get('keibajo', '不明')
-                    kai = list_json.get('kai', '1')
-                    nichi = list_json.get('nichi', '1')
-                    course_info = get_course_info(keibajo, kai, nichi)
-
-                    current_list = load_json_file(RACE_LIST_FILE)
-                    current_list[keibajo] = {
-                        'races': list_json.get('races', {}),
-                        'course_info': course_info
-                    }
-                    save_json_file(RACE_LIST_FILE, current_list)
-                    send_to_gas_async('save_race_list', list_json)
-
-                    reply_text = f"【本日の{keibajo}競馬場 全レース一覧・コース情報（{course_info}）を記憶しました】"
-                else:
-                    reply_text = "⚠️ 全レース一覧の読み取りに失敗しました。もう一度送信してください。"
-
-                messaging_api.reply_message(
-                    ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
-                )
-
-            elif image_type == 'BABA':
-                extract_baba_prompt = (
-                    "この馬場情報画像から【競馬場名】、【天候】、【芝の馬場状態】、【ダートの馬場状態】を抽出し、以下のJSON形式のみで出力してください。\n"
-                    "{\"keibajo\": \"札幌\", \"tenko\": \"晴\", \"shiba\": \"良\", \"dirt\": \"良\"}\n"
-                    "※JSON以外の文字列は含めないでください。"
-                )
-                baba_json = None
-                for model_name in candidate_models:
-                    try:
-                        res = ai_client.models.generate_content(
-                            model=model_name,
-                            contents=[processed_image, extract_baba_prompt],
-                            config=deterministic_config
-                        )
-                        if res and res.text:
-                            raw_text = str(res.text).replace('```json', '').replace('```', '').strip()
-                            baba_json = json.loads(raw_text)
-                            break
-                    except Exception as b_err:
-                        logging.warning(f"Baba extract [{model_name}] error: {b_err}")
-                        continue
-
-                if isinstance(baba_json, dict) and 'keibajo' in baba_json:
-                    keibajo = str(baba_json.get('keibajo', '不明'))
-                    current_baba = load_json_file(BABA_FILE)
-                    current_baba[keibajo] = {
-                        'tenko': str(baba_json.get('tenko', '不明')),
-                        'shiba': str(baba_json.get('shiba', '不明')),
-                        'dirt': str(baba_json.get('dirt', '不明'))
-                    }
-                    save_json_file(BABA_FILE, current_baba)
-                    send_to_gas_async('save_baba', baba_json)
-
-                    reply_text = (
-                        f"【本日の馬場情報を更新・記憶しました】\n"
-                        f"📍 競馬場：【{keibajo}競馬場】\n"
-                        f"🌤 天候：{baba_json.get('tenko', '不明')}\n"
-                        f"🌿 芝：{baba_json.get('shiba', '不明')}\n"
-                        f"🟫 ダート：{baba_json.get('dirt', '不明')}"
-                    )
-                else:
-                    reply_text = "⚠️ 馬場情報の読み取りに失敗しました。もう一度送信してください。"
-
-                messaging_api.reply_message(
-                    ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
-                )
-
-            else:
-                # 出馬表（RACE）の画像をバッファへ追加（スレッドセーフ）
+            def process_race_prediction():
+                global latest_reply_token, current_timer
                 with buffer_lock:
-                    image_buffer.append(processed_image)
-                    latest_reply_token = event.reply_token  # 常に最新のトークンを更新
+                    imgs = list(image_buffer)
+                    image_buffer.clear()
+                    r_token = latest_reply_token
+                    current_timer = None
 
-                def process_race_prediction():
-                    global latest_reply_token
-                    with buffer_lock:
-                        imgs = list(image_buffer)
-                        image_buffer.clear()
-                        r_token = latest_reply_token
+                if not imgs or not r_token:
+                    return
 
-                    if not imgs or not r_token:
-                        return
+                candidate_models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash']
+                deterministic_config = types.GenerateContentConfig(temperature=0.0)
 
-                    baba_data = load_json_file(BABA_FILE)
-                    list_data = load_json_file(RACE_LIST_FILE)
-
-                    # 1枚目の画像から競馬場・トラック・距離を取得
-                    race_info_prompt = (
-                        "画像の上部ヘッダーやタイトルから【競馬場名】、【コース種別（芝またはダート）】、【距離（数字のみ）】を読み取り、\n"
-                        "以下のJSON形式のみで出力してください。\n"
-                        "{\"keibajo\": \"中京\", \"track_type\": \"ダート\", \"distance\": \"1800\"}\n"
-                        "※JSON以外出力禁止。"
+                # 送信画像が1枚のみの場合のみ、LIST(一覧)またはBABA(馬場)の判定を行う
+                image_type = 'RACE'
+                if len(imgs) == 1:
+                    classify_prompt = (
+                        "送られた画像を判定してください。\n"
+                        "・1R〜12Rなどの『全レース一覧・コース距離表』の画面であれば \"LIST\" と答えてください。\n"
+                        "・『馬場情報（天候、芝・ダートの馬場状態）』の画面であれば \"BABA\" と答えてください。\n"
+                        "・それ以外の『出馬表（馬名やオッズが並ぶ画面）』であれば \"RACE\" と答えてください。\n"
+                        "回答は \"LIST\"、\"BABA\"、\"RACE\" の英字1単語のみにしてください。"
                     )
-                    keibajo_name, track_type, distance_num = "", "", ""
-                    for m_name in candidate_models:
-                        try:
-                            info_res = ai_client.models.generate_content(
-                                model=m_name,
-                                contents=[imgs[0], race_info_prompt],
-                                config=deterministic_config
-                            )
-                            if info_res and info_res.text:
-                                raw_i = str(info_res.text).replace('```json', '').replace('```', '').strip()
-                                info_json = json.loads(raw_i)
-                                keibajo_name = info_json.get('keibajo', '')
-                                track_type = info_json.get('track_type', '')
-                                distance_num = str(info_json.get('distance', ''))
-                                break
-                        except Exception as i_err:
-                            continue
-
-                    baba_context_str = "【記憶されている本日のリアルタイム馬場・コース情報】\n"
-                    if baba_data:
-                        for k, v in baba_data.items():
-                            c_info = list_data.get(k, {}).get('course_info', '標準') if isinstance(list_data.get(k), dict) else '標準'
-                            baba_context_str += f"・[{k}競馬場] 天候:{v.get('tenko')} / 芝:{v.get('shiba')} / ダ:{v.get('dirt')} / コース区分:{c_info}\n"
-                    else:
-                        baba_context_str += "・未設定（標準の良馬場として判定）\n"
-
-                    past_results_str = fetch_past_results_from_gas(keibajo_name, track_type, distance_num)
-                    past_data_context = ""
-                    if past_results_str:
-                        past_data_context = (
-                            f"\n【スプレッドシートから取得した[{keibajo_name} {track_type}{distance_num}m]の直近同条件過去データ（参照用）】\n"
-                            "以下の過去同条件データから、該当コースの『勝ちタイム水準』『上がり3Fタイム限界値』『好走馬の4角通過順傾向』を抽出し、今回の出走馬の走破能力と照らし合わせて判定に反映させてください。\n"
-                            "※直近（最新）の1〜2件の通過順・脚質傾向を特に強く評価してください。\n"
-                            + past_results_str[:3000] + "\n"
-                        )
-
-                    prompt = (
-                        "送られた1枚または2枚の出馬表画像を解析してください。\n"
-                        "※2枚の画像が送られた場合は、必ず1枚目の出走馬（1番〜）と2枚目の出走馬（続きの馬番〜全頭）を1つの出馬表として統合・結合し、全ての馬（1番から最終馬番まで）を漏れなく評価対象にしてください。\n"
-                        "※2枚の画像で中央付近の馬（馬番）が重複して映っている場合は、馬番を基準にしてダブりを自動削除して全頭1つに結合してください。\n\n"
-                        + baba_context_str
-                        + past_data_context + "\n"
-                        "【絶対厳守ルール】\n"
-                        "1. タイトル表記：冒頭は必ず『【中京1R ダ1800m】』のように競馬場・レース番号・距離条件を完全に明記すること。\n"
-                        "2. 馬番認識：画像内の1番から最終馬番までの馬番・馬名・負担重量・騎手・前走着順・通過順を正確に読み取ること。\n"
-                        "3. 買い目整合性：『■ 3. おすすめの買い目』の馬番は、必ず『■ 2. 印・期待度と推奨理由』の印付き馬と完全一致させること。\n"
-                        "4. 過去データの照合：スプレッドシートの同条件過去データから勝ちタイム水準・上がり時計・直近の通過順傾向を参照し、今回の出走馬の数値と客観的に比較して根拠に組み込むこと。\n\n"
-                        "【新・激走穴馬（☆）抜擢ロジック】\n"
-                        "人気や前走の着順を完全に無視し、以下の数値トリガーを満たす伏兵馬を必ず☆（穴馬）または上位印に抜擢すること。\n"
-                        "・前走不向きな展開（前残り馬場で後方から上がり上位を使って惨敗等）からの巻き返し\n"
-                        "・今回大幅な斤量減（-2kg〜-4kg）または馬体重増減の改善\n"
-                        "・前走と異なるトラックバイアス・距離変更での一変\n"
-                        "・過去データで示したコース勝ちタイム水準・上がり時計に対応できる持ち時計・走破潜在力を持つ馬\n\n"
-                        "【出力フォーマット】\n"
-                        "■ 1. レース概要：【〇〇〇R 芝/ダ〇〇〇m】 [レースの堅実度：A〜C]\n"
-                        "（展開・馬場・ペース・過去データ照合に基づく分析）\n\n"
-                        "■ 2. 印・期待度と推奨理由\n"
-                        "◎ 【本命】 〇番 馬名（騎手名） [期待度：〇% / 評価：S〜B]\n"
-                        "◯ 【対抗】 〇番 馬名（騎手名） [期待度：〇% / 評価：S〜B]\n"
-                        "▲ 【単穴】 〇番 馬名（騎手名） [期待度：〇% / 評価：S〜B]\n"
-                        "☆ 【穴馬】 〇番 馬名（騎手名） [期待度：〇% / 評価：S〜B]\n"
-                        "△ 【連下】 〇番 馬名（騎手名） [期待度：〇% / 評価：B〜C]\n\n"
-                        "■ 3. おすすめの買い目\n"
-                        "【選定券種】\n"
-                        "軸馬：〇\n"
-                        "相手：〇, 〇, 〇\n\n"
-                        "※馬券購入は自己責任でお願いします"
-                    )
-
-                    content_list = imgs + [prompt]
-                    reply_text = None
                     for model_name in candidate_models:
                         try:
                             res = ai_client.models.generate_content(
                                 model=model_name,
-                                contents=content_list,
+                                contents=[imgs[0], classify_prompt],
                                 config=deterministic_config
                             )
                             if res and res.text:
-                                reply_text = str(res.text)
-                                send_to_gas_async('save_prediction', reply_text)
+                                text_upper = str(res.text).strip().upper()
+                                if 'LIST' in text_upper:
+                                    image_type = 'LIST'
+                                elif 'BABA' in text_upper:
+                                    image_type = 'BABA'
                                 break
-                        except Exception as p_err:
-                            logging.warning(f"Prediction attempt [{model_name}] error: {p_err}")
+                        except Exception:
                             continue
 
-                    if not reply_text:
-                        reply_text = "⚠️ 出馬表の読み取り・予想作成に失敗しました。もう一度送信してください。"
+                if image_type == 'LIST':
+                    extract_list_prompt = (
+                        "この画像から【開催競馬場名】と【各レース(1R〜12R)のコース・距離・条件】、【開催節情報（例：1回札幌4日）】を抽出し、以下のJSON形式のみで出力してください。\n"
+                        "{\"keibajo\": \"札幌\", \"kai\": \"1\", \"nichi\": \"4\", \"races\": {\"1R\": \"ダ1700m\", \"2R\": \"芝1200m\"}}\n"
+                        "※JSON以外の文字列は含めないでください。"
+                    )
+                    list_json = None
+                    for model_name in candidate_models:
+                        try:
+                            res = ai_client.models.generate_content(
+                                model=model_name,
+                                contents=[imgs[0], extract_list_prompt],
+                                config=deterministic_config
+                            )
+                            if res and res.text:
+                                raw_text = str(res.text).replace('```json', '').replace('```', '').strip()
+                                list_json = json.loads(raw_text)
+                                break
+                        except Exception:
+                            continue
 
-                    if len(reply_text) > 4900:
-                        reply_text = reply_text[:4900] + "\n...(以下省略)"
+                    if isinstance(list_json, dict) and 'keibajo' in list_json:
+                        keibajo = list_json.get('keibajo', '不明')
+                        kai = list_json.get('kai', '1')
+                        nichi = list_json.get('nichi', '1')
+                        course_info = get_course_info(keibajo, kai, nichi)
+
+                        current_list = load_json_file(RACE_LIST_FILE)
+                        current_list[keibajo] = {
+                            'races': list_json.get('races', {}),
+                            'course_info': course_info
+                        }
+                        save_json_file(RACE_LIST_FILE, current_list)
+                        send_to_gas_async('save_race_list', list_json)
+                        reply_text = f"【本日の{keibajo}競馬場 全レース一覧・コース情報（{course_info}）を記憶しました】"
+                    else:
+                        reply_text = "⚠️ 全レース一覧の読み取りに失敗しました。もう一度送信してください。"
 
                     with ApiClient(configuration) as api_client_inner:
                         m_api = MessagingApi(api_client_inner)
-                        m_api.reply_message(
-                            ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)])
+                        m_api.reply_message(ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)]))
+                    return
+
+                elif image_type == 'BABA':
+                    extract_baba_prompt = (
+                        "この馬場情報画像から【競馬場名】、【天候】、【芝の馬場状態】、【ダートの馬場状態】を抽出し、以下のJSON形式のみで出力してください。\n"
+                        "{\"keibajo\": \"札幌\", \"tenko\": \"晴\", \"shiba\": \"良\", \"dirt\": \"良\"}\n"
+                        "※JSON以外の文字列は含めないでください。"
+                    )
+                    baba_json = None
+                    for model_name in candidate_models:
+                        try:
+                            res = ai_client.models.generate_content(
+                                model=model_name,
+                                contents=[imgs[0], extract_baba_prompt],
+                                config=deterministic_config
+                            )
+                            if res and res.text:
+                                raw_text = str(res.text).replace('```json', '').replace('```', '').strip()
+                                baba_json = json.loads(raw_text)
+                                break
+                        except Exception:
+                            continue
+
+                    if isinstance(baba_json, dict) and 'keibajo' in baba_json:
+                        keibajo = str(baba_json.get('keibajo', '不明'))
+                        current_baba = load_json_file(BABA_FILE)
+                        current_baba[keibajo] = {
+                            'tenko': str(baba_json.get('tenko', '不明')),
+                            'shiba': str(baba_json.get('shiba', '不明')),
+                            'dirt': str(baba_json.get('dirt', '不明'))
+                        }
+                        save_json_file(BABA_FILE, current_baba)
+                        send_to_gas_async('save_baba', baba_json)
+
+                        reply_text = (
+                            f"【本日の馬場情報を更新・記憶しました】\n"
+                            f"📍 競馬場：【{keibajo}競馬場】\n"
+                            f"🌤 天候：{baba_json.get('tenko', '不明')}\n"
+                            f"🌿 芝：{baba_json.get('shiba', '不明')}\n"
+                            f"🟫 ダート：{baba_json.get('dirt', '不明')}"
                         )
+                    else:
+                        reply_text = "⚠️ 馬場情報の読み取りに失敗しました。もう一度送信してください。"
 
-                # 同時送信された画像が全てバッファに溜まり切るまでタイマーをリセットしながら待機（1.5秒）
-                if current_timer is not None:
-                    current_timer.cancel()
+                    with ApiClient(configuration) as api_client_inner:
+                        m_api = MessagingApi(api_client_inner)
+                        m_api.reply_message(ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)]))
+                    return
 
-                current_timer = threading.Timer(1.5, process_race_prediction)
-                current_timer.start()
+                # 【出馬表（RACE）全頭統合予想処理】
+                baba_data = load_json_file(BABA_FILE)
+                list_data = load_json_file(RACE_LIST_FILE)
+
+                # 全画像の中から競馬場・トラック・距離を抽出
+                race_info_prompt = (
+                    "送られた全画像の中から【競馬場名】、【コース種別（芝またはダート）】、【距離（数字のみ）】を読み取り、\n"
+                    "以下のJSON形式のみで出力してください。\n"
+                    "{\"keibajo\": \"中京\", \"track_type\": \"ダート\", \"distance\": \"1800\"}\n"
+                    "※JSON以外出力禁止。"
+                )
+                keibajo_name, track_type, distance_num = "", "", ""
+                for m_name in candidate_models:
+                    try:
+                        info_res = ai_client.models.generate_content(
+                            model=m_name,
+                            contents=imgs + [race_info_prompt],
+                            config=deterministic_config
+                        )
+                        if info_res and info_res.text:
+                            raw_i = str(info_res.text).replace('```json', '').replace('```', '').strip()
+                            info_json = json.loads(raw_i)
+                            keibajo_name = info_json.get('keibajo', '')
+                            track_type = info_json.get('track_type', '')
+                            distance_num = str(info_json.get('distance', ''))
+                            break
+                    except Exception:
+                        continue
+
+                baba_context_str = "【記憶されている本日のリアルタイム馬場・コース情報】\n"
+                if baba_data:
+                    for k, v in baba_data.items():
+                        c_info = list_data.get(k, {}).get('course_info', '標準') if isinstance(list_data.get(k), dict) else '標準'
+                        baba_context_str += f"・[{k}競馬場] 天候:{v.get('tenko')} / 芝:{v.get('shiba')} / ダ:{v.get('dirt')} / コース区分:{c_info}\n"
+                else:
+                    baba_context_str += "・未設定（標準の良馬場として判定）\n"
+
+                past_results_str = fetch_past_results_from_gas(keibajo_name, track_type, distance_num)
+                past_data_context = ""
+                if past_results_str:
+                    past_data_context = (
+                        f"\n【スプレッドシートから取得した[{keibajo_name} {track_type}{distance_num}m]の直近同条件過去データ（参照用）】\n"
+                        "以下の過去同条件データから、該当コースの『勝ちタイム水準』『上がり3Fタイム限界値』『好走馬の4角通過順傾向』を抽出し、今回の出走馬の走破能力と照らし合わせて判定に反映させてください。\n"
+                        "※直近（最新）の1〜2件の通過順・脚質傾向を特に強く評価してください。\n"
+                        + past_results_str[:3000] + "\n"
+                    )
+
+                prompt = (
+                    "送られた全ての出馬表画像（1枚または複数枚）を解析してください。\n"
+                    "【最重要原則】\n"
+                    "送られた画像全体に映っている全出走馬（1番から最後の18番など大外馬まで）を必ず1つの統合出馬表として網羅・統合し、1頭も漏らさず評価対象にしてください。\n"
+                    "※画像間で重複している馬番がある場合は、馬番をキーにして自動でダブりを削除し、全頭分を完全結合してください。\n\n"
+                    + baba_context_str
+                    + past_data_context + "\n"
+                    "【絶対厳守ルール】\n"
+                    "1. タイトル表記：冒頭は必ず『【〇〇1R ダ1800m】』のように競馬場・レース番号・距離条件を完全に明記すること。\n"
+                    "2. 馬番全頭認識：画像内の1番から最後の馬番（18番など）までの全頭の馬番・馬名・負担重量・騎手・前走着順・通過順を正確に読み取ること。\n"
+                    "3. 買い目整合性：『■ 3. おすすめの買い目』の馬番は、必ず『■ 2. 印・期待度と推奨理由』の印付き馬と完全一致させること。\n"
+                    "4. 過去データの照合：スプレッドシートの同条件過去データから勝ちタイム水準・上がり時計・直近の通過順傾向を参照し、今回の出走馬の数値と客観的に比較して根拠に組み込むこと。\n\n"
+                    "【新・激走穴馬（☆）抜擢ロジック】\n"
+                    "人気や前走の着順を完全に無視し、以下の数値トリガーを満たす伏兵馬を必ず☆（穴馬）または上位印に抜擢すること。\n"
+                    "・前走不向きな展開（前残り馬場で後方から上がり上位を使って惨敗等）からの巻き返し\n"
+                    "・今回大幅な斤量減（-2kg〜-4kg）または馬体重増減の改善\n"
+                    "・前走と異なるトラックバイアス・距離変更での一変\n"
+                    "・過去データで示したコース勝ちタイム水準・上がり時計に対応できる持ち時計・走破潜在力を持つ馬\n\n"
+                    "【出力フォーマット】\n"
+                    "■ 1. レース概要：【〇〇〇R 芝/ダ〇〇〇m】 [レースの堅実度：A〜C]\n"
+                    "（展開・馬場・ペース・過去データ照合に基づく分析）\n\n"
+                    "■ 2. 印・期待度と推奨理由\n"
+                    "◎ 【本命】 〇番 馬名（騎手名） [期待度：〇% / 評価：S〜B]\n"
+                    "◯ 【対抗】 〇番 馬名（騎手名） [期待度：〇% / 評価：S〜B]\n"
+                    "▲ 【単穴】 〇番 馬名（騎手名） [期待度：〇% / 評価：S〜B]\n"
+                    "☆ 【穴馬】 〇番 馬名（騎手名） [期待度：〇% / 評価：S〜B]\n"
+                    "△ 【連下】 〇番 馬名（騎手名） [期待度：〇% / 評価：B〜C]\n\n"
+                    "■ 3. おすすめの買い目\n"
+                    "【選定券種】\n"
+                    "軸馬：〇\n"
+                    "相手：〇, 〇, 〇\n\n"
+                    "※馬券購入は自己責任でお願いします"
+                )
+
+                content_list = imgs + [prompt]
+                reply_text = None
+                for model_name in candidate_models:
+                    try:
+                        res = ai_client.models.generate_content(
+                            model=model_name,
+                            contents=content_list,
+                            config=deterministic_config
+                        )
+                        if res and res.text:
+                            reply_text = str(res.text)
+                            send_to_gas_async('save_prediction', reply_text)
+                            break
+                    except Exception as p_err:
+                        logging.warning(f"Prediction attempt [{model_name}] error: {p_err}")
+                        continue
+
+                if not reply_text:
+                    reply_text = "⚠️ 出馬表の読み取り・予想作成に失敗しました。もう一度送信してください。"
+
+                if len(reply_text) > 4900:
+                    reply_text = reply_text[:4900] + "\n...(以下省略)"
+
+                with ApiClient(configuration) as api_client_inner:
+                    m_api = MessagingApi(api_client_inner)
+                    m_api.reply_message(
+                        ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)])
+                    )
+
+            # ★2.5秒間バッファに全画像が揃うのを確実に待ち受ける
+            if current_timer is not None:
+                current_timer.cancel()
+
+            current_timer = threading.Timer(2.5, process_race_prediction)
+            current_timer.start()
 
         except Exception as e:
             logging.error(f"System error: {e}")
