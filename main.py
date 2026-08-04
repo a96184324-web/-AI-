@@ -214,7 +214,6 @@ def handle_image(event):
             raw_image = Image.open(io.BytesIO(image_bytes))
             processed_image = process_image_for_ocr(raw_image)
 
-            # ★最重要修正：画像の判定を待たず、届いた瞬間に即時バッファへ追加（分割事故を完全に防ぐ）
             with buffer_lock:
                 image_buffer.append(processed_image)
                 latest_reply_token = event.reply_token
@@ -233,7 +232,6 @@ def handle_image(event):
                 candidate_models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash']
                 deterministic_config = types.GenerateContentConfig(temperature=0.0)
 
-                # 送信画像が1枚のみの場合のみ、LIST(一覧)またはBABA(馬場)の判定を行う
                 image_type = 'RACE'
                 if len(imgs) == 1:
                     classify_prompt = (
@@ -354,7 +352,6 @@ def handle_image(event):
                 baba_data = load_json_file(BABA_FILE)
                 list_data = load_json_file(RACE_LIST_FILE)
 
-                # 全画像の中から競馬場・トラック・距離を抽出
                 race_info_prompt = (
                     "送られた全画像の中から【競馬場名】、【コース種別（芝またはダート）】、【距離（数字のみ）】を読み取り、\n"
                     "以下のJSON形式のみで出力してください。\n"
@@ -406,16 +403,18 @@ def handle_image(event):
                     + past_data_context + "\n"
                     "【絶対厳守ルール】\n"
                     "1. タイトル表記：冒頭は必ず『【〇〇1R ダ1800m】』のように競馬場・レース番号・距離条件を完全に明記すること。\n"
-                    "2. 馬番全頭認識：画像内の1番から最後の馬番（18番など）までの全頭の馬番・馬名・負担重量・騎手・前走着順・通過順を正確に読み取ること。\n"
-                    "3. 買い目整合性：『■ 3. おすすめの買い目』の馬番は、必ず『■ 2. 印・期待度と推奨理由』の印付き馬と完全一致させること。\n"
-                    "4. 過去データの照合：スプレッドシートの同条件過去データから勝ちタイム水準・上がり時計・直近の通過順傾向を参照し、今回の出走馬の数値と客観的に比較して根拠に組み込むこと。\n\n"
+                    "2. マークダウン太字記号『**』の使用は完全禁止とする。文字強調の記号は一切含めないこと。\n"
+                    "3. 全頭リストや注釈・補足テキストなどの余計な項目は一切出力しないこと。\n"
+                    "4. 馬番全頭認識：画像内の1番から最後の馬番までの全頭を正確に読み取り評価すること。\n"
+                    "5. 買い目整合性：『■ 3. おすすめの買い目』の馬番は、必ず『■ 2. 印・期待度と推奨理由』の印付き馬と完全一致させること。\n"
+                    "6. 過去データの照合：スプレッドシートの同条件過去データから勝ちタイム水準・上がり時計・直近の通過順傾向を参照し、今回の出走馬の数値と客観的に比較して根拠に組み込むこと。\n\n"
                     "【新・激走穴馬（☆）抜擢ロジック】\n"
                     "人気や前走の着順を完全に無視し、以下の数値トリガーを満たす伏兵馬を必ず☆（穴馬）または上位印に抜擢すること。\n"
                     "・前走不向きな展開（前残り馬場で後方から上がり上位を使って惨敗等）からの巻き返し\n"
                     "・今回大幅な斤量減（-2kg〜-4kg）または馬体重増減の改善\n"
                     "・前走と異なるトラックバイアス・距離変更での一変\n"
                     "・過去データで示したコース勝ちタイム水準・上がり時計に対応できる持ち時計・走破潜在力を持つ馬\n\n"
-                    "【出力フォーマット】\n"
+                    "【出力フォーマット（※指定以外の文字列・記号は一切追加禁止）】\n"
                     "■ 1. レース概要：【〇〇〇R 芝/ダ〇〇〇m】 [レースの堅実度：A〜C]\n"
                     "（展開・馬場・ペース・過去データ照合に基づく分析）\n\n"
                     "■ 2. 印・期待度と推奨理由\n"
@@ -442,6 +441,8 @@ def handle_image(event):
                         )
                         if res and res.text:
                             reply_text = str(res.text)
+                            # 太字記号 ** の自動除去フィルター
+                            reply_text = reply_text.replace('**', '')
                             send_to_gas_async('save_prediction', reply_text)
                             break
                     except Exception as p_err:
@@ -460,7 +461,6 @@ def handle_image(event):
                         ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)])
                     )
 
-            # ★2.5秒間バッファに全画像が揃うのを確実に待ち受ける
             if current_timer is not None:
                 current_timer.cancel()
 
