@@ -382,7 +382,7 @@ def handle_image(event):
 
                 list_data = load_json_file(RACE_LIST_FILE)
 
-                # 1. 出馬表画像から「競馬場名」と「レース番号」を強力取得
+                # 出馬表画像から「競馬場名」と「レース番号」を事前抽出
                 race_info_prompt = (
                     "送られた全画像の中から【競馬場名（例: 中京、新潟）】と【レース番号（例: 1R、2R）】、【コース種別（芝またはダート）】、【距離（数字のみ）】を読み取り、\n"
                     "以下のJSON形式のみで出力してください。\n"
@@ -398,4 +398,138 @@ def handle_image(event):
                             config=deterministic_config
                         )
                         if info_res and info_res.text:
-                            raw_i = str(info_res.text).replace('```json', '').replace('
+                            raw_i = str(info_res.text).replace('```json', '').replace('```', '').strip()
+                            info_json = json.loads(raw_i)
+                            keibajo_name = str(info_json.get('keibajo', '')).strip()
+                            raw_r = str(info_json.get('race_num', '')).strip()
+                            if raw_r and not raw_r.endswith('R'):
+                                race_num = f"{raw_r}R"
+                            else:
+                                race_num = raw_r
+                            track_type = str(info_json.get('track_type', '')).strip()
+                            distance_num = str(info_json.get('distance', '')).strip()
+                            break
+                    except Exception:
+                        continue
+
+                # 事前記憶された正解コース一覧（RACE_LIST_FILE）からの完全自動オーバーライド（芝・ダート誤認および距離誤認の絶対防止）
+                if keibajo_name in list_data and 'races' in list_data[keibajo_name]:
+                    races_dict = list_data[keibajo_name].get('races', {})
+                    if race_num in races_dict:
+                        saved_condition = str(races_dict[race_num])
+                        if "ダ" in saved_condition:
+                            track_type = "ダート"
+                        elif "芝" in saved_condition:
+                            track_type = "芝"
+                        
+                        m = re.search(r'\d+', saved_condition)
+                        if m:
+                            distance_num = m.group(0)
+
+                baba_context_str = "【記憶されている本日のリアルタイム馬場・コース情報】\n"
+                if baba_data:
+                    for k, v in baba_data.items():
+                        c_info = list_data.get(k, {}).get('course_info', '標準') if isinstance(list_data.get(k), dict) else '標準'
+                        baba_context_str += f"・[{k}競馬場] 天候:{v.get('tenko')} / 芝:{v.get('shiba')} / ダ:{v.get('dirt')} / コース区分:{c_info}\n"
+                else:
+                    baba_context_str += "・未設定（標準の良馬場として判定）\n"
+
+                # 補正済みの正解トラック種別（芝/ダート）・正解距離を使ってGASから過去データを抽出
+                past_results_str = fetch_past_results_from_gas(keibajo_name, track_type, distance_num)
+                past_data_context = ""
+                if past_results_str:
+                    past_data_context = (
+                        f"\n【スプレッドシートから取得した[{keibajo_name} {track_type}{distance_num}m]の直近同条件過去データ（参照用）】\n"
+                        "以下の過去同条件データから、該当コースの『勝ちタイム水準』『上がり3Fタイム限界値』『好走馬の4角通過順傾向』を抽出し、今回の出走馬の走破能力と照らし合わせて判定に反映させてください。\n"
+                        "※直近（最新）の1〜2件の通過順・脚質傾向を特に強く評価してください。\n"
+                        + past_results_str[:3000] + "\n"
+                    )
+
+                confirmed_condition_str = (
+                    f"【絶対確定条件（※AI改変禁止）】\n"
+                    f"・対象レース：{keibajo_name}{race_num}\n"
+                    f"・コース種別：{track_type}\n"
+                    f"・距離：{distance_num}m\n"
+                    f"※画像の見た目や表記に惑わされず、上記【{keibajo_name}{race_num} {track_type}{distance_num}m】を100%正解としてタイトルおよび分析文の前提に適用してください。\n\n"
+                )
+
+                prompt = (
+                    "送られた全ての出馬表画像（1枚または複数枚）を解析してください。\n"
+                    "【最重要原則】\n"
+                    "送られた画像全体に映っている全出走馬（1番から最後の18番など大外馬まで）を必ず1つの統合出馬表として網羅・統合し、1頭も漏らさず評価対象にしてください。\n"
+                    "※画像間で重複している馬番がある場合は、馬番をキーにして自動でダブりを削除し、全頭分を完全結合してください。\n\n"
+                    + confirmed_condition_str
+                    + baba_context_str
+                    + past_data_context + "\n"
+                    "【絶対厳守ルール】\n"
+                    f"1. タイトル表記：冒頭は必ず『【{keibajo_name}{race_num} {track_type}{distance_num}m】』のように【絶対確定条件】をそのまま完全に記述すること。（「ダート」と「芝」の誤表記は厳禁）。\n"
+                    "2. マークダウン太字記号『**』の使用は完全禁止とする。文字強調の記号は一切含めないこと。\n"
+                    "3. 全頭リストや注釈・補足テキストなどの余計な項目は一切出力しないこと。\n"
+                    "4. 馬番全頭認識：画像内の1番から最後の馬番までの全頭を正確に読み取り評価すること。\n"
+                    "5. 買い目整合性：『■ 3. おすすめの買い目』の馬番は、必ず『■ 2. 印・期待度と推奨理由』の印付き馬と完全一致させること。\n"
+                    "6. 券種明記：『■ 3. おすすめの買い目』の1行目は、必ず『【選定券種：馬連・ワイド】』や『【選定券種：3連複】』のように、推奨する具体券種名を明確に記述すること。\n"
+                    "7. 過去データの照合：スプレッドシートの同条件過去データから勝ちタイム水準・上がり時計・直近の通過順傾向を参照し、今回の出走馬の数値と客観的に比較して根拠に組み込むこと。\n\n"
+                    "【新・激走穴馬（☆）抜擢ロジック】\n"
+                    "人気や前走の着順を完全に無視し、以下の数値トリガーを満たす伏兵馬を必ず☆（穴馬）または上位印に抜擢すること。\n"
+                    "・前走不向きな展開（前残り馬場で後方から上がり上位を使って惨敗等）からの巻き返し\n"
+                    "・今回大幅な斤量減（-2kg〜-4kg）または馬体重増減の改善\n"
+                    "・前走と異なるトラックバイアス・距離変更での一変\n"
+                    "・過去データで示したコース勝ちタイム水準・上がり時計に対応できる持ち時計・走破潜在力を持つ馬\n\n"
+                    "【出力フォーマット（※指定以外の文字列・記号は一切追加禁止）】\n"
+                    f"■ 1. レース概要：【{keibajo_name}{race_num} {track_type}{distance_num}m】 [レースの堅実度：A〜C]\n"
+                    "（展開・馬場・ペース・過去データ照合に基づく分析）\n\n"
+                    "■ 2. 印・期待度と推奨理由\n"
+                    "◎ 【本命】 〇番 馬名（騎手名） [期待度：〇% / 評価：S〜B]\n"
+                    "◯ 【対抗】 〇番 馬名（騎手名） [期待度：〇% / 評価：S〜B]\n"
+                    "▲ 【単穴】 〇番 馬名（騎手名） [期待度：〇% / 評価：S〜B]\n"
+                    "☆ 【穴馬】 〇番 馬名（騎手名） [期待度：〇% / 評価：S〜B]\n"
+                    "△ 【連下】 〇番 馬名（騎手名） [期待度：〇% / 評価：B〜C]\n\n"
+                    "■ 3. おすすめの買い目\n"
+                    "【選定券種：馬連・ワイド】\n"
+                    "軸馬：〇\n"
+                    "相手：〇, 〇, 〇\n\n"
+                    "※馬券購入は自己責任でお願いします"
+                )
+
+                content_list = imgs + [prompt]
+                reply_text = None
+                for model_name in candidate_models:
+                    try:
+                        res = ai_client.models.generate_content(
+                            model=model_name,
+                            contents=content_list,
+                            config=deterministic_config
+                        )
+                        if res and res.text:
+                            reply_text = str(res.text)
+                            reply_text = reply_text.replace('**', '')
+                            send_to_gas_async('save_prediction', reply_text)
+                            break
+                    except Exception as p_err:
+                        logging.warning(f"Prediction attempt [{model_name}] error: {p_err}")
+                        continue
+
+                if not reply_text:
+                    reply_text = "⚠️ 出馬表の読み取り・予想作成に失敗しました。もう一度送信してください。"
+
+                if len(reply_text) > 4900:
+                    reply_text = reply_text[:4900] + "\n...(以下省略)"
+
+                with ApiClient(configuration) as api_client_inner:
+                    m_api = MessagingApi(api_client_inner)
+                    m_api.reply_message(
+                        ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)])
+                    )
+
+            if current_timer is not None:
+                current_timer.cancel()
+
+            current_timer = threading.Timer(2.5, process_race_prediction)
+            current_timer.start()
+
+        except Exception as e:
+            logging.error(f"System error: {e}")
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
