@@ -382,10 +382,11 @@ def handle_image(event):
 
                 list_data = load_json_file(RACE_LIST_FILE)
 
+                # 出馬表画像から「競馬場名」と「レース番号」を事前抽出
                 race_info_prompt = (
-                    "送られた全画像の中から【競馬場名（例: 中京、新潟）】と【レース番号（例: 1R、2R）】、【コース種別（芝またはダート）】、【距離（数字のみ）】を読み取り、\n"
+                    "送られた全画像の中から【競馬場名（例: 札幌、中京）】と【レース番号（例: 8R）】、【コース種別（芝またはダート）】、【距離（数字のみ）】を読み取り、\n"
                     "以下のJSON形式のみで出力してください。\n"
-                    "{\"keibajo\": \"中京\", \"race_num\": \"2R\", \"track_type\": \"芝\", \"distance\": \"1400\"}\n"
+                    "{\"keibajo\": \"札幌\", \"race_num\": \"8R\", \"track_type\": \"芝\", \"distance\": \"1200\"}\n"
                     "※JSON以外出力禁止。"
                 )
                 keibajo_name, race_num, track_type, distance_num = "", "", "", ""
@@ -411,19 +412,34 @@ def handle_image(event):
                     except Exception:
                         continue
 
-                # 事前記憶された正解コース一覧（RACE_LIST_FILE）からの完全自動オーバーライド
-                if keibajo_name in list_data and 'races' in list_data[keibajo_name]:
-                    races_dict = list_data[keibajo_name].get('races', {})
-                    if race_num in races_dict:
-                        saved_condition = str(races_dict[race_num])
-                        if "ダ" in saved_condition:
+                # 表記ゆれ対応の柔軟マッチングロジック
+                matched_keibajo_key = None
+                for k in list_data.keys():
+                    if k in keibajo_name or keibajo_name in k:
+                        matched_keibajo_key = k
+                        break
+
+                m_race_num = re.search(r'\d+', race_num)
+
+                if matched_keibajo_key and 'races' in list_data[matched_keibajo_key]:
+                    races_dict = list_data[matched_keibajo_key].get('races', {})
+                    target_condition = None
+
+                    for r_key, cond_str in races_dict.items():
+                        m_key = re.search(r'\d+', str(r_key))
+                        if m_key and m_race_num and m_key.group(0) == m_race_num.group(0):
+                            target_condition = str(cond_str)
+                            break
+
+                    if target_condition:
+                        if "ダ" in target_condition:
                             track_type = "ダート"
-                        elif "芝" in saved_condition:
+                        elif "芝" in target_condition:
                             track_type = "芝"
                         
-                        m = re.search(r'\d+', saved_condition)
-                        if m:
-                            distance_num = m.group(0)
+                        m_dist = re.search(r'\d+', target_condition)
+                        if m_dist:
+                            distance_num = m_dist.group(0)
 
                 baba_context_str = "【記憶されている本日のリアルタイム馬場・コース情報】\n"
                 if baba_data:
@@ -465,7 +481,9 @@ def handle_image(event):
                     "3. 全頭リストや注釈・補足テキストなどの余計な項目は一切出力しないこと。\n"
                     "4. 馬番全頭認識：画像内の1番から最後の馬番までの全頭を正確に読み取り評価すること。\n"
                     "5. 買い目整合性：『■ 3. おすすめの買い目』の馬番は、必ず『■ 2. 印・期待度と推奨理由』の印付き馬と完全一致させること。\n"
-                    "6. 券種明記：『■ 3. おすすめの買い目』の1行目は、レースの堅実度や波乱度、本命馬の期待度に応じて「単勝」「馬連・ワイド」「3連複」「3連単」「馬単」等から最も期待値の高い最適な券種を選定して明記すること。\n"
+                    "6. 券種多様化および縦並び表記（絶対厳守）：\n"
+                    "   ・レースの堅実度や波乱度に応じ、「3連複」「3連単」「馬単」「単勝」「馬連」「ワイド」等から最適な券種を選定すること。\n"
+                    "   ・買い目を表示する際は、フォーメーションや流し・BOXなどの構成要素（1着/2着/3着、軸馬/相手馬など）を【必ず改行して縦並び】で視認性良く表示すること。横一列の箇条書きは禁止とする。\n"
                     "7. 過去データの照合：スプレッドシートの同条件過去データから勝ちタイム水準・上がり時計・直近の通過順傾向を参照し、今回の出走馬の数値と客観的に比較して根拠に組み込むこと。\n\n"
                     "【新・激走穴馬（☆）抜擢ロジック】\n"
                     "人気や前走の着順を完全に無視し、以下の数値トリガーを満たす伏兵馬を必ず☆（穴馬）または上位印に抜擢すること。\n"
@@ -483,8 +501,14 @@ def handle_image(event):
                     "☆ 【穴馬】 〇番 馬名（騎手名） [期待度：〇% / 評価：S〜B]\n"
                     "△ 【連下】 〇番 馬名（騎手名） [期待度：〇% / 評価：B〜C]\n\n"
                     "■ 3. おすすめの買い目\n"
-                    "【選定券種：〇〇（※波乱度等に応じ「単勝・複勝」「馬連・ワイド」「3連複」「3連単」等から最適なものを記載）】\n"
-                    "軸馬：〇\n"
+                    "【選定券種：〇〇（選んだ券種名を明記）】\n"
+                    "（※フォーメーションや流しなどは以下のように【必ず改行した縦並び】で視認性良く出力すること）\n"
+                    "例1（3連複フォーメーションの場合）：\n"
+                    "1頭目：〇\n"
+                    "2頭目：〇, 〇\n"
+                    "3頭目：〇, 〇, 〇, 〇\n"
+                    "例2（馬単1着固定流しの場合）：\n"
+                    "1着：〇\n"
                     "相手：〇, 〇, 〇\n\n"
                     "※馬券購入は自己責任でお願いします"
                 )
