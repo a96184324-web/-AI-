@@ -103,6 +103,7 @@ def send_to_gas_async(action, payload_data):
     thread.start()
 
 def fetch_past_results_from_gas(keibajo="", track_type="", distance=""):
+    """最新GASの action === 'get_past_results' へピンポイントリクエスト"""
     if not GAS_WEBAPP_URL:
         return ""
     try:
@@ -127,7 +128,7 @@ def fetch_past_results_from_gas(keibajo="", track_type="", distance=""):
     return ""
 
 def fetch_baba_from_gas():
-    """スプレッドシートの馬場情報履歴から本日のデータを補元・取得する"""
+    """サーバー再起動時にスプレッドシートの「馬場情報履歴」から本日のデータを自動復元"""
     if not GAS_WEBAPP_URL:
         return {}
     try:
@@ -375,7 +376,7 @@ def handle_image(event):
 
                 # 【出馬表（RACE）全頭統合予想処理】
                 baba_data = load_json_file(BABA_FILE)
-                # 馬場情報ファイルが空の場合、スプレッドシートからフォールバック取得
+                # ★追加：ローカルに馬場情報がない場合（サーバー再起動等）、GASから本日の馬場を復元
                 if not baba_data:
                     gas_baba = fetch_baba_from_gas()
                     if gas_baba:
@@ -384,6 +385,7 @@ def handle_image(event):
 
                 list_data = load_json_file(RACE_LIST_FILE)
 
+                # レース番号（race_num）も含めて画像から事前抽出
                 race_info_prompt = (
                     "送られた全画像の中から【競馬場名】、【レース番号（例: 1R）】、【コース種別（芝またはダート）】、【距離（数字のみ）】を読み取り、\n"
                     "以下のJSON形式のみで出力してください。\n"
@@ -409,7 +411,7 @@ def handle_image(event):
                     except Exception:
                         continue
 
-                # ★核心修正：記憶データ（RACE_LIST_FILE）に該当レースの決定距離があれば強制補正（誤読・1200m誤認を100%防止）
+                # ★核心補正：全レース一覧（RACE_LIST_FILE）に記憶された正解データから距離を強制上書き補正（1200m誤認等のハルシネーションを100%防止）
                 if keibajo_name in list_data and 'races' in list_data[keibajo_name]:
                     races_dict = list_data[keibajo_name].get('races', {})
                     if race_num in races_dict:
@@ -420,7 +422,7 @@ def handle_image(event):
                             track_type = "芝"
                         m = re.search(r'\d+', saved_condition)
                         if m:
-                            distance_num = m.group(0) # 強制的に "1400" など記憶された正しい数値へ補正
+                            distance_num = m.group(0) # 1400等へ確実上書き
 
                 baba_context_str = "【記憶されている本日のリアルタイム馬場・コース情報】\n"
                 if baba_data:
@@ -430,7 +432,7 @@ def handle_image(event):
                 else:
                     baba_context_str += "・未設定（標準の良馬場として判定）\n"
 
-                # 正確に補正された距離条件を使ってGASから過去データを抽出
+                # 補正済みの正解距離・トラック種別を使ってGASから過去テキストデータを抽出
                 past_results_str = fetch_past_results_from_gas(keibajo_name, track_type, distance_num)
                 past_data_context = ""
                 if past_results_str:
