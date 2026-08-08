@@ -126,6 +126,31 @@ def fetch_past_results_from_gas(keibajo="", track_type="", distance=""):
         logging.error(f"Failed to fetch past results from GAS: {e}")
     return ""
 
+def fetch_baba_from_gas():
+    """スプレッドシートの馬場情報履歴から本日のデータを補元・取得する"""
+    if not GAS_WEBAPP_URL:
+        return {}
+    try:
+        payload = {
+            'action': 'get_baba',
+            'date': get_jst_today()
+        }
+        response = requests.post(
+            GAS_WEBAPP_URL,
+            data=json.dumps(payload),
+            headers={'Content-Type': 'application/json'},
+            timeout=15
+        )
+        if response.status_code == 200:
+            res_json = response.json()
+            if isinstance(res_json, dict) and res_json.get('status') == 'SUCCESS':
+                data = res_json.get('data', {})
+                if isinstance(data, dict):
+                    return data
+    except Exception as e:
+        logging.error(f"Failed to fetch baba info from GAS: {e}")
+    return {}
+
 def get_course_info(keibajo, kai, nichi):
     try:
         kai_str = f"{kai}回"
@@ -350,15 +375,22 @@ def handle_image(event):
 
                 # 【出馬表（RACE）全頭統合予想処理】
                 baba_data = load_json_file(BABA_FILE)
+                # 馬場情報ファイルが空の場合、スプレッドシートからフォールバック取得
+                if not baba_data:
+                    gas_baba = fetch_baba_from_gas()
+                    if gas_baba:
+                        baba_data = gas_baba
+                        save_json_file(BABA_FILE, baba_data)
+
                 list_data = load_json_file(RACE_LIST_FILE)
 
                 race_info_prompt = (
-                    "送られた全画像の中から【競馬場名】、【コース種別（芝またはダート）】、【距離（数字のみ）】を読み取り、\n"
+                    "送られた全画像の中から【競馬場名】、【レース番号（例: 1R）】、【コース種別（芝またはダート）】、【距離（数字のみ）】を読み取り、\n"
                     "以下のJSON形式のみで出力してください。\n"
-                    "{\"keibajo\": \"中京\", \"track_type\": \"ダート\", \"distance\": \"1800\"}\n"
+                    "{\"keibajo\": \"新潟\", \"race_num\": \"1R\", \"track_type\": \"芝\", \"distance\": \"1400\"}\n"
                     "※JSON以外出力禁止。"
                 )
-                keibajo_name, track_type, distance_num = "", "", ""
+                keibajo_name, race_num, track_type, distance_num = "", "", "", ""
                 for m_name in candidate_models:
                     try:
                         info_res = ai_client.models.generate_content(
@@ -370,11 +402,25 @@ def handle_image(event):
                             raw_i = str(info_res.text).replace('```json', '').replace('```', '').strip()
                             info_json = json.loads(raw_i)
                             keibajo_name = info_json.get('keibajo', '')
+                            race_num = info_json.get('race_num', '')
                             track_type = info_json.get('track_type', '')
                             distance_num = str(info_json.get('distance', ''))
                             break
                     except Exception:
                         continue
+
+                # ★核心修正：記憶データ（RACE_LIST_FILE）に該当レースの決定距離があれば強制補正（誤読・1200m誤認を100%防止）
+                if keibajo_name in list_data and 'races' in list_data[keibajo_name]:
+                    races_dict = list_data[keibajo_name].get('races', {})
+                    if race_num in races_dict:
+                        saved_condition = str(races_dict[race_num]) # 例: "芝1400m"
+                        if "ダ" in saved_condition:
+                            track_type = "ダート"
+                        elif "芝" in saved_condition:
+                            track_type = "芝"
+                        m = re.search(r'\d+', saved_condition)
+                        if m:
+                            distance_num = m.group(0) # 強制的に "1400" など記憶された正しい数値へ補正
 
                 baba_context_str = "【記憶されている本日のリアルタイム馬場・コース情報】\n"
                 if baba_data:
@@ -384,6 +430,7 @@ def handle_image(event):
                 else:
                     baba_context_str += "・未設定（標準の良馬場として判定）\n"
 
+                # 正確に補正された距離条件を使ってGASから過去データを抽出
                 past_results_str = fetch_past_results_from_gas(keibajo_name, track_type, distance_num)
                 past_data_context = ""
                 if past_results_str:
@@ -394,15 +441,18 @@ def handle_image(event):
                         + past_results_str[:3000] + "\n"
                     )
 
+                confirmed_condition_str = f"【確定された正しいレース条件】{keibajo_name}{race_num} {track_type}{distance_num}m\n※画像の表記と異なる場合は必ずこの確定条件をタイトルに優先採用してください。\n\n"
+
                 prompt = (
                     "送られた全ての出馬表画像（1枚または複数枚）を解析してください。\n"
                     "【最重要原則】\n"
                     "送られた画像全体に映っている全出走馬（1番から最後の18番など大外馬まで）を必ず1つの統合出馬表として網羅・統合し、1頭も漏らさず評価対象にしてください。\n"
                     "※画像間で重複している馬番がある場合は、馬番をキーにして自動でダブりを削除し、全頭分を完全結合してください。\n\n"
+                    + confirmed_condition_str
                     + baba_context_str
                     + past_data_context + "\n"
                     "【絶対厳守ルール】\n"
-                    "1. タイトル表記：冒頭は必ず『【〇〇1R ダ1800m】』のように競馬場・レース番号・距離条件を完全に明記すること。\n"
+                    "1. タイトル表記：冒頭は必ず『【〇〇1R 芝/ダ〇〇〇m】』のように【確定された正しいレース条件】に基いて競馬場・レース番号・距離条件を完全に明記すること。\n"
                     "2. マークダウン太字記号『**』の使用は完全禁止とする。文字強調の記号は一切含めないこと。\n"
                     "3. 全頭リストや注釈・補足テキストなどの余計な項目は一切出力しないこと。\n"
                     "4. 馬番全頭認識：画像内の1番から最後の馬番までの全頭を正確に読み取り評価すること。\n"
