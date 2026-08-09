@@ -38,6 +38,7 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 BABA_FILE = 'baba_info.json'
 RACE_LIST_FILE = 'race_list_info.json'
+TREND_FILE = 'trend_info.json'
 
 processed_message_ids = set()
 
@@ -150,6 +151,30 @@ def fetch_baba_from_gas():
         logging.error(f"Failed to fetch baba info from GAS: {e}")
     return {}
 
+def fetch_trend_from_gas():
+    if not GAS_WEBAPP_URL:
+        return {}
+    try:
+        payload = {
+            'action': 'get_trend',
+            'date': get_jst_today()
+        }
+        response = requests.post(
+            GAS_WEBAPP_URL,
+            data=json.dumps(payload),
+            headers={'Content-Type': 'application/json'},
+            timeout=15
+        )
+        if response.status_code == 200:
+            res_json = response.json()
+            if isinstance(res_json, dict) and res_json.get('status') == 'SUCCESS':
+                data = res_json.get('data', {})
+                if isinstance(data, dict):
+                    return data
+    except Exception as e:
+        logging.error(f"Failed to fetch trend info from GAS: {e}")
+    return {}
+
 def get_course_info(keibajo, kai, nichi):
     try:
         kai_str = f"{kai}回"
@@ -207,7 +232,7 @@ def handle_text(event):
 
     reply_text = (
         "メッセージありがとうございます！\n"
-        "LINEからは【出馬表・馬場情報・レース一覧のスクショ画像】を送信してください。\n\n"
+        "LINEからは【出馬表・馬場情報・レース一覧・本日の傾向】のスクショ画像を送信してください。\n\n"
         "※レース結果テキストの一括保存・解析は、専用のWebフォームから行ってください。"
     )
 
@@ -256,31 +281,34 @@ def handle_image(event):
                 candidate_models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash']
                 deterministic_config = types.GenerateContentConfig(temperature=0.0)
 
+                # 画像分類処理（LIST, BABA, TREND, RACE）
                 image_type = 'RACE'
-                if len(imgs) == 1:
-                    classify_prompt = (
-                        "送られた画像を判定してください。\n"
-                        "・1R〜12Rなどの『全レース一覧・コース距離表』の画面であれば \"LIST\" と答えてください。\n"
-                        "・『馬場情報（天候、芝・ダートの馬場状態）』の画面であれば \"BABA\" と答えてください。\n"
-                        "・それ以外の『出馬表（馬名やオッズが並ぶ画面）』であれば \"RACE\" と答えてください。\n"
-                        "回答は \"LIST\"、\"BABA\"、\"RACE\" の英字1単語のみにしてください。"
-                    )
-                    for model_name in candidate_models:
-                        try:
-                            res = ai_client.models.generate_content(
-                                model=model_name,
-                                contents=[imgs[0], classify_prompt],
-                                config=deterministic_config
-                            )
-                            if res and res.text:
-                                text_upper = str(res.text).strip().upper()
-                                if 'LIST' in text_upper:
-                                    image_type = 'LIST'
-                                elif 'BABA' in text_upper:
-                                    image_type = 'BABA'
-                                break
-                        except Exception:
-                            continue
+                classify_prompt = (
+                    "送られた画像を判定してください。\n"
+                    "・1R〜12Rなどの『全レース一覧・コース距離表』の画面であれば \"LIST\" と答えてください。\n"
+                    "・『馬場情報（天候、芝・ダートの馬場状態）』の画面であれば \"BABA\" と答えてください。\n"
+                    "・JRA-VANなどの『本日の傾向（馬番、騎手、脚質ごとの着順一覧）』画面であれば \"TREND\" と答えてください。\n"
+                    "・それ以外の『出馬表（馬名やオッズが並ぶ画面）』であれば \"RACE\" と答えてください。\n"
+                    "回答は \"LIST\"、\"BABA\"、\"TREND\"、\"RACE\" の英字1単語のみにしてください。"
+                )
+                for model_name in candidate_models:
+                    try:
+                        res = ai_client.models.generate_content(
+                            model=model_name,
+                            contents=imgs + [classify_prompt],
+                            config=deterministic_config
+                        )
+                        if res and res.text:
+                            text_upper = str(res.text).strip().upper()
+                            if 'LIST' in text_upper:
+                                image_type = 'LIST'
+                            elif 'BABA' in text_upper:
+                                image_type = 'BABA'
+                            elif 'TREND' in text_upper:
+                                image_type = 'TREND'
+                            break
+                    except Exception:
+                        continue
 
                 if image_type == 'LIST':
                     extract_list_prompt = (
@@ -372,6 +400,50 @@ def handle_image(event):
                         m_api.reply_message(ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)]))
                     return
 
+                elif image_type == 'TREND':
+                    extract_trend_prompt = (
+                        "送られた画像（本日の傾向：馬番・騎手・脚質画面）から【競馬場名】と【各レースの好走馬（脚質傾向・馬番傾向・好調騎手）】を抽出し、以下のJSON形式のみで出力してください。\n"
+                        "{\"keibajo\": \"札幌\", \"summary\": \"前半レースでは先行・逃げの馬券絡みが80%と前残りバイアス強め。騎手は横山和生・浜中俊が好調。\"}\n"
+                        "※JSON以外の文字列は含めないでください。"
+                    )
+                    trend_json = None
+                    for model_name in candidate_models:
+                        try:
+                            res = ai_client.models.generate_content(
+                                model=model_name,
+                                contents=imgs + [extract_trend_prompt],
+                                config=deterministic_config
+                            )
+                            if res and res.text:
+                                raw_text = str(res.text).replace('```json', '').replace('```', '').strip()
+                                trend_json = json.loads(raw_text)
+                                break
+                        except Exception:
+                            continue
+
+                    if isinstance(trend_json, dict) and 'keibajo' in trend_json:
+                        keibajo = str(trend_json.get('keibajo', '不明'))
+                        summary_str = str(trend_json.get('summary', ''))
+                        current_trend = load_json_file(TREND_FILE)
+                        current_trend[keibajo] = {
+                            'summary': summary_str
+                        }
+                        save_json_file(TREND_FILE, current_trend)
+                        send_to_gas_async('save_trend', trend_json)
+
+                        reply_text = (
+                            f"【本日の{keibajo}競馬場 リアルタイム傾向（バイアス）を記憶しました】\n"
+                            f"📊 傾向分析：{summary_str}\n\n"
+                            f"※後半レースの予想作成時にこのバイアスを組み込んで自動分析します。"
+                        )
+                    else:
+                        reply_text = "⚠️ 本日の傾向画像の読み取りに失敗しました。もう一度送信してください。"
+
+                    with ApiClient(configuration) as api_client_inner:
+                        m_api = MessagingApi(api_client_inner)
+                        m_api.reply_message(ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)]))
+                    return
+
                 # 【出馬表（RACE）全頭統合予想処理】
                 baba_data = load_json_file(BABA_FILE)
                 if not baba_data:
@@ -379,6 +451,13 @@ def handle_image(event):
                     if gas_baba:
                         baba_data = gas_baba
                         save_json_file(BABA_FILE, baba_data)
+
+                trend_data = load_json_file(TREND_FILE)
+                if not trend_data:
+                    gas_trend = fetch_trend_from_gas()
+                    if gas_trend:
+                        trend_data = gas_trend
+                        save_json_file(TREND_FILE, trend_data)
 
                 list_data = load_json_file(RACE_LIST_FILE)
 
@@ -412,7 +491,7 @@ def handle_image(event):
                     except Exception:
                         continue
 
-                # 表記ゆれ対応の柔軟マッチングロジック
+                # 表記ゆれ対応のマッチングロジック
                 matched_keibajo_key = None
                 for k in list_data.keys():
                     if k in keibajo_name or keibajo_name in k:
@@ -449,6 +528,13 @@ def handle_image(event):
                 else:
                     baba_context_str += "・未設定（標準の良馬場として判定）\n"
 
+                trend_context_str = "【記憶されている本日のリアルタイム傾向（バイアス）情報】\n"
+                if trend_data:
+                    for k, v in trend_data.items():
+                        trend_context_str += f"・[{k}競馬場] {v.get('summary')}\n"
+                else:
+                    trend_context_str += "・未設定（標準傾向として判定）\n"
+
                 past_results_str = fetch_past_results_from_gas(keibajo_name, track_type, distance_num)
                 past_data_context = ""
                 if past_results_str:
@@ -474,6 +560,7 @@ def handle_image(event):
                     "※画像間で重複している馬番がある場合は、馬番をキーにして自動でダブりを削除し、全頭分を完全結合してください。\n\n"
                     + confirmed_condition_str
                     + baba_context_str
+                    + trend_context_str
                     + past_data_context + "\n"
                     "【絶対厳守ルール】\n"
                     f"1. タイトル表記：冒頭は必ず『【{keibajo_name}{race_num} {track_type}{distance_num}m】』のように【絶対確定条件】をそのまま完全に記述すること。（「ダート」と「芝」の誤表記は厳禁）。\n"
@@ -484,8 +571,9 @@ def handle_image(event):
                     "6. レース波乱度の適正判定と評価の一体化（重要）：\n"
                     "   ・レース概要の波乱度は『順当』『混戦』『波乱』の3段階のみで判断すること。安全思考で『混戦』ばかりに逃げず、圧倒的本命がいる場合は『順当』、ハンデ戦・穴馬台頭が見込まれる場合は『波乱』と客観的に判定すること。\n"
                     "   ・各馬の評価は『[連対期待度：〇%]』という単一の数字表記に完全統一し、『S〜B』といった別軸の評価記号は出力禁止とする。\n"
+                    "   ・『本日のリアルタイム傾向（バイアス）』が記憶されている場合、好調な脚質（逃げ・先行・差し）や好調騎手の馬を割り増し評価すること。\n"
                     "7. 券種選定と買い目点数の厳格制御（最重要）：\n"
-                    "   ・『【選定券種：〇〇】』という見出しラベルは完全に排除し、買い目の冒頭ヘッダーに『【馬単1着固定流し】』や『【3连複フォーメーション】』『【3連単フォーメーション】』のように直接記述すること。\n"
+                    "   ・『【選定券種：〇〇】』という見出しラベルは完全に排除し、買い目の冒頭ヘッダーに『【馬単1着固定流し】』や『【3連複フォーメーション】』『【3連単フォーメーション】』のように直接記述すること。\n"
                     "   ・『順当』または◎本命の信頼度が極めて高い場合はリスクを恐れず『馬単』や『3連単』を優先選定すること。\n"
                     "   ・馬連や馬単で軸1頭から流す場合、相手は最大2〜3頭までに限定厳選すること（買い目が散らかってトリガミになる5頭ベタ流し等は厳禁）。\n"
                     "   ・買い目構成（1着/2着/3着、1頭目/2頭目/3頭目など）は【必ず改行した縦並び】で視認性良く出力すること。\n"
@@ -498,7 +586,7 @@ def handle_image(event):
                     "・過去データで示したコース勝ちタイム水準・上がり時計に対応できる持ち時計・走破潜在力を持つ馬\n\n"
                     "【出力フォーマット（※指定以外の文字列・記号は一切追加禁止）】\n"
                     f"■ 1. レース概要：【{keibajo_name}{race_num} {track_type}{distance_num}m】 [レース波乱度：順当／混戦／波乱から選定]\n"
-                    "（展開・馬場・ペース・過去データ照合に基づく分析）\n\n"
+                    "（展開・馬場・本日バイアス・過去データ照合に基づく分析）\n\n"
                     "■ 2. 印・推奨理由と連対期待度\n"
                     "◎ 【本命】 〇番 馬名（騎手名） [連対期待度：〇%]\n"
                     "◯ 【対抗】 〇番 馬名（騎手名） [連対期待度：〇%]\n"
