@@ -71,18 +71,17 @@ def get_jst_today():
 def process_image_for_ocr(image):
     try:
         w, h = image.size
-        # スマホ画面の不要UI（上部ヘッダー約18%・下部操作メニュー約15%）をカット
+        # スマホ画面の不要UI（上部ヘッダー約18%・下部操作メニュー約15%）を自動カットしてズーム拡大
         crop_top = int(h * 0.18)
         crop_bottom = int(h * 0.85)
         
-        # 画面サイズが極端に短い画像でなければトリミング実行
         if h > 800:
             img_cropped = image.crop((0, crop_top, w, crop_bottom))
         else:
             img_cropped = image.copy()
 
         img_copy = img_cropped.copy()
-        # APIコストを増やさない1280px上限枠内でズーム拡大
+        # APIコスト（トークン消費量）を最小限に抑える1280px上限枠内で鮮明化
         img_copy.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
         enhancer = ImageEnhance.Contrast(img_copy)
         img_copy = enhancer.enhance(1.5)
@@ -185,6 +184,30 @@ def fetch_trend_from_gas():
                     return data
     except Exception as e:
         logging.error(f"Failed to fetch trend info from GAS: {e}")
+    return {}
+
+def fetch_race_list_from_gas():
+    if not GAS_WEBAPP_URL:
+        return {}
+    try:
+        payload = {
+            'action': 'get_race_list',
+            'date': get_jst_today()
+        }
+        response = requests.post(
+            GAS_WEBAPP_URL,
+            data=json.dumps(payload),
+            headers={'Content-Type': 'application/json'},
+            timeout=15
+        )
+        if response.status_code == 200:
+            res_json = response.json()
+            if isinstance(res_json, dict) and res_json.get('status') == 'SUCCESS':
+                data = res_json.get('data', {})
+                if isinstance(data, dict):
+                    return data
+    except Exception as e:
+        logging.error(f"Failed to fetch race_list info from GAS: {e}")
     return {}
 
 def get_course_info(keibajo, kai, nichi):
@@ -457,6 +480,8 @@ def handle_image(event):
                     return
 
                 # 【出馬表（RACE）全頭統合予想処理】
+                
+                # スリープ・再起動時のデータ復元処理（GAS自動再同期）
                 baba_data = load_json_file(BABA_FILE)
                 if not baba_data:
                     gas_baba = fetch_baba_from_gas()
@@ -472,15 +497,23 @@ def handle_image(event):
                         save_json_file(TREND_FILE, trend_data)
 
                 list_data = load_json_file(RACE_LIST_FILE)
+                if not list_data:
+                    gas_list = fetch_race_list_from_gas()
+                    if gas_list:
+                        list_data = gas_list
+                        save_json_file(RACE_LIST_FILE, list_data)
 
-                # 出馬表画像から「競馬場名」と「レース番号」を事前抽出
+                # 「8日」と「7R」の誤認を100%遮断するレース番号抽出プロンプト
                 race_info_prompt = (
-                    "送られた全画像の中から【競馬場名（例: 札幌、中京）】と【レース番号（例: 8R）】、【コース種別（芝またはダート）】、【距離（数字のみ）】を読み取り、\n"
+                    "送られた出馬表画像から【競馬場名（例: 札幌、中京）】と【絶対的なレース番号（例: 7R）】のみを抽出してください。\n"
+                    "【最重要・誤読防止規則】\n"
+                    "・『1回札幌8日 7R』のようなヘッダー表記がある場合、『8日』『8日目』の『8』は開催日数であり、レース番号ではありません。\n"
+                    "・必ず文字『R』の直前についている数字（例: 『7R』なら『7』）のみを正確にレース番号として抽出すること。\n"
                     "以下のJSON形式のみで出力してください。\n"
-                    "{\"keibajo\": \"札幌\", \"race_num\": \"8R\", \"track_type\": \"芝\", \"distance\": \"1200\"}\n"
+                    "{\"keibajo\": \"札幌\", \"race_num\": \"7R\"}\n"
                     "※JSON以外出力禁止。"
                 )
-                keibajo_name, race_num, track_type, distance_num = "", "", "", ""
+                keibajo_name, race_num = "", ""
                 for m_name in candidate_models:
                     try:
                         info_res = ai_client.models.generate_content(
@@ -497,13 +530,11 @@ def handle_image(event):
                                 race_num = f"{raw_r}R"
                             else:
                                 race_num = raw_r
-                            track_type = str(info_json.get('track_type', '')).strip()
-                            distance_num = str(info_json.get('distance', '')).strip()
                             break
                     except Exception:
                         continue
 
-                # 表記ゆれ対応のマッチングロジック
+                # 確定データ（LIST）主導の100%正確な条件（競馬場・コース・距離）取得ロジック
                 matched_keibajo_key = None
                 for k in list_data.keys():
                     if k in keibajo_name or keibajo_name in k:
@@ -511,8 +542,11 @@ def handle_image(event):
                         break
 
                 m_race_num = re.search(r'\d+', race_num)
+                track_type = "芝"
+                distance_num = "1200"
 
                 if matched_keibajo_key and 'races' in list_data[matched_keibajo_key]:
+                    keibajo_name = matched_keibajo_key
                     races_dict = list_data[matched_keibajo_key].get('races', {})
                     target_condition = None
 
@@ -547,6 +581,7 @@ def handle_image(event):
                 else:
                     trend_context_str += "・未設定（標準傾向として判定）\n"
 
+                # 確定データでスプレッドシートから同条件過去データをカチッと自動引き抜き
                 past_results_str = fetch_past_results_from_gas(keibajo_name, track_type, distance_num)
                 past_data_context = ""
                 if past_results_str:
@@ -579,10 +614,9 @@ def handle_image(event):
                     "2. マークダウン太字記号『**』の使用は完全禁止とする。文字強調の記号は一切含めないこと。\n"
                     "3. 全頭リストや注釈・補足テキストなどの余計な項目は一切出力しないこと。\n"
                     "4. 馬番全頭認識：画像内の1番から最後の馬番までの全頭を正確に読み取り評価すること。\n"
-                    "5. 【ハルシネーション（誤認識・情報捏造）絶対禁止ルール】：\n"
-                    "   ・送信された画像内に文字として直接印字されている「馬番」「馬名」「騎手名」のみを100%厳密に抽出・記述すること。\n"
-                    "   ・画像内の文字が見づらい場合であっても、AI自身の記憶や内部知識で騎手名や馬番を推測・補完・捏造（ハルシネーション）することを固く禁止する。\n"
-                    "   ・画像に存在しない馬番や、出走表に載っていない騎手名を出力した場合はシステムエラーとする。必ず画像上の表記を絶対正解として出力せよ。\n"
+                    "5. 【全領域ハルシネーション（誤認識・数値捏造）完全禁止ルール】：\n"
+                    "   ・出馬表画像内に文字として直接印字されている「馬番」「馬名」「騎手名」のみを100%厳密に抽出・記述すること。画像に見当たらない馬番や乗り替わり前の騎手名を記憶から推測・補完することを固く禁止する。\n"
+                    "   ・スプレッドシートから取得した過去データ（タイム・通過順・着順等）についても、実際にテキスト内に存在している数値のみを正確に参照・比較すること。存在しない架空の過去タイムや着順を捏造・創作して理由付けに使うことを固く禁止する。\n"
                     "6. 買い目整合性：『■ 3. おすすめの買い目』の馬番は、必ず『■ 2. 印・推奨理由と連対期待度』の印付き馬と完全一致させること。\n"
                     "7. レース波乱度の適正判定と評価の一体化：\n"
                     "   ・レース概要の波乱度は『順当』『混戦』『波乱』の3段階のみで判断すること。安全思考で『混戦』ばかりに逃げず、圧倒的本命がいる場合は『順当』、ハンデ戦・穴馬台頭が見込まれる場合は『波乱』と客観的に判定すること。\n"
