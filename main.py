@@ -71,7 +71,6 @@ def get_jst_today():
 def process_image_for_ocr(image):
     try:
         w, h = image.size
-        # ここで上部18%をカットするため、JRAの緑ヘッダーが見えなくなっていた
         crop_top = int(h * 0.18)
         crop_bottom = int(h * 0.85)
         
@@ -219,7 +218,7 @@ def get_course_info(keibajo, kai, nichi):
                     return f"{course}コース（開幕{nichi_num}日目）"
     except Exception as e:
         logging.error(f"Course master lookup error: {e}")
-    return f"開幕{nichi}日目"
+    return "開催区分"
 
 def load_json_file(filepath):
     if os.path.exists(filepath):
@@ -295,16 +294,13 @@ def handle_image(event):
             blob_api = MessagingApiBlob(api_client)
             image_bytes = blob_api.get_message_content(message_id=msg_id)
             
-            # 元画像（ヘッダー確認用：トリミングなし）
             raw_image = Image.open(io.BytesIO(image_bytes))
             raw_for_header = raw_image.copy()
             raw_for_header.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
             
-            # 解析用画像（出馬表本文用：上下トリミング・コントラスト補正済み）
             processed_image = process_image_for_ocr(raw_image)
 
             with buffer_lock:
-                # 生画像と加工済み画像の両方をセットで保存する
                 image_buffer.append((raw_for_header, processed_image))
                 latest_reply_token = event.reply_token
 
@@ -319,7 +315,6 @@ def handle_image(event):
                 if not imgs_data or not r_token:
                     return
 
-                # 用途に合わせて画像を分離
                 raw_imgs = [item[0] for item in imgs_data]
                 proc_imgs = [item[1] for item in imgs_data]
 
@@ -336,7 +331,6 @@ def handle_image(event):
                     "回答は \"LIST\"、\"BABA\"、\"TREND\"、\"RACE\" の英字1単語のみにしてください。"
                 )
                 
-                # 画像種別の判定にはヘッダーが見える「生画像（raw_imgs）」を使用
                 for model_name in candidate_models:
                     try:
                         res = ai_client.models.generate_content(
@@ -359,8 +353,8 @@ def handle_image(event):
                 if image_type == 'LIST':
                     extract_list_prompt = (
                         "この画像から【開催競馬場名】と【各レース(1R〜12R)のコース・距離・条件】、【開催節情報（例：1回〇〇4日）】を抽出し、以下のJSON形式のみで出力してください。\n"
-                        "{\"keibajo\": \"競馬場名\", \"kai\": \"1\", \"nichi\": \"4\", \"races\": {\"1R\": \"ダ1700m\", \"2R\": \"芝1200m\"}}\n"
-                        "※JSON以外の文字列は含めないでください。"
+                        "{\"keibajo\": \"競馬場名\", \"kai\": \"数字\", \"nichi\": \"数字\", \"races\": {\"1R\": \"ダ1700m\", \"2R\": \"芝1200m\"}}\n"
+                        "※不明な項目は空文字 \"\" にし、無理に推測しないでください。JSON以外の文字列は出力禁止。"
                     )
                     list_json = None
                     for model_name in candidate_models:
@@ -377,11 +371,11 @@ def handle_image(event):
                         except Exception:
                             continue
 
-                    if isinstance(list_json, dict) and 'keibajo' in list_json:
-                        keibajo = list_json.get('keibajo', '不明')
-                        kai = list_json.get('kai', '1')
-                        nichi = list_json.get('nichi', '1')
-                        course_info = get_course_info(keibajo, kai, nichi)
+                    if isinstance(list_json, dict) and list_json.get('keibajo'):
+                        keibajo = str(list_json.get('keibajo')).strip()
+                        kai = str(list_json.get('kai', '')).strip()
+                        nichi = str(list_json.get('nichi', '')).strip()
+                        course_info = get_course_info(keibajo, kai, nichi) if kai and nichi else "開催区分"
 
                         current_list = load_json_file(RACE_LIST_FILE)
                         current_list[keibajo] = {
@@ -392,7 +386,7 @@ def handle_image(event):
                         send_to_gas_async('save_race_list', list_json)
                         reply_text = f"【本日の{keibajo}競馬場 全レース一覧・コース情報（{course_info}）を記憶しました】"
                     else:
-                        reply_text = "⚠️ 全レース一覧の読み取りに失敗しました。もう一度送信してください。"
+                        reply_text = "⚠️ 全レース一覧の読み取りに失敗しました。画像を明るく撮影し直して再送してください。"
 
                     with ApiClient(configuration) as api_client_inner:
                         m_api = MessagingApi(api_client_inner)
@@ -402,8 +396,8 @@ def handle_image(event):
                 elif image_type == 'BABA':
                     extract_baba_prompt = (
                         "この馬場情報画像から【競馬場名】、【天候】、【芝の馬場状態】、【ダートの馬場状態】を抽出し、以下のJSON形式のみで出力してください。\n"
-                        "{\"keibajo\": \"競馬場名\", \"tenko\": \"晴\", \"shiba\": \"良\", \"dirt\": \"良\"}\n"
-                        "※JSON以外の文字列は含めないでください。"
+                        "{\"keibajo\": \"競馬場名\", \"tenko\": \"天候\", \"shiba\": \"馬場\", \"dirt\": \"馬場\"}\n"
+                        "※不明な項目は \"不明\" とし、JSON以外の文字列は含めないでください。"
                     )
                     baba_json = None
                     for model_name in candidate_models:
@@ -420,8 +414,8 @@ def handle_image(event):
                         except Exception:
                             continue
 
-                    if isinstance(baba_json, dict) and 'keibajo' in baba_json:
-                        keibajo = str(baba_json.get('keibajo', '不明'))
+                    if isinstance(baba_json, dict) and baba_json.get('keibajo') and baba_json.get('keibajo') != "不明":
+                        keibajo = str(baba_json.get('keibajo')).strip()
                         current_baba = load_json_file(BABA_FILE)
                         current_baba[keibajo] = {
                             'tenko': str(baba_json.get('tenko', '不明')),
@@ -449,8 +443,8 @@ def handle_image(event):
                 elif image_type == 'TREND':
                     extract_trend_prompt = (
                         "送られた画像（本日の傾向：馬番・騎手・脚質画面）から【競馬場名】と【各レースの好走馬（脚質傾向・馬番傾向・好調騎手）】を抽出し、以下のJSON形式のみで出力してください。\n"
-                        "{\"keibajo\": \"競馬場名\", \"summary\": \"前半レースの傾向上限...\"}\n"
-                        "※JSON以外の文字列は含めないでください。"
+                        "{\"keibajo\": \"競馬場名\", \"summary\": \"傾向の要約分析\"}\n"
+                        "※不明な項目は \"不明\" とし、JSON以外の文字列は含めないでください。"
                     )
                     trend_json = None
                     for model_name in candidate_models:
@@ -467,8 +461,8 @@ def handle_image(event):
                         except Exception:
                             continue
 
-                    if isinstance(trend_json, dict) and 'keibajo' in trend_json:
-                        keibajo = str(trend_json.get('keibajo', '不明'))
+                    if isinstance(trend_json, dict) and trend_json.get('keibajo') and trend_json.get('keibajo') != "不明":
+                        keibajo = str(trend_json.get('keibajo')).strip()
                         summary_str = str(trend_json.get('summary', ''))
                         current_trend = load_json_file(TREND_FILE)
                         current_trend[keibajo] = {
@@ -511,7 +505,7 @@ def handle_image(event):
                         list_data = gas_list
                         save_json_file(RACE_LIST_FILE, list_data)
 
-                # レース情報の抽出には、ヘッダーが欠けていない「生画像（raw_imgs）」を使用する
+                # レース情報抽出：画像にない文字を捏造・空埋めすることを固く禁止する
                 race_info_prompt = (
                     "送られた画像内に印字されている『競馬場名』と『レース番号』を、視覚的に文字をそのまま抽出してください。\n"
                     "【絶対厳守ルール：ハルシネーション・忖度禁止】\n"
@@ -542,23 +536,25 @@ def handle_image(event):
                     except Exception:
                         continue
 
-                # 【安全ガード】読み取り失敗時は強行せずにエラーで止める
-                if keibajo_name == "不明" or race_num == "不明":
-                    reply_text = "⚠️ 競馬場名またはレース番号が正しく読み取れませんでした。\nJRAの緑色のヘッダー（〇回〇〇〇日 △R）が画面に映っている状態でスクリーンショットを撮影し直して再送してください。"
+                # 【厳格ガード1】場名・レース番号が「不明」または空文字の場合は即座に処理中断
+                if not keibajo_name or keibajo_name == "不明" or not race_num or race_num == "不明":
+                    reply_text = "⚠️ 競馬場名またはレース番号が正しく読み取れませんでした。\nJRAの緑色のヘッダー（〇回〇〇〇日 △R）が映っているスクリーンショットを送信してください。"
                     with ApiClient(configuration) as api_client_inner:
                         m_api = MessagingApi(api_client_inner)
                         m_api.reply_message(ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)]))
                     return
 
+                # 【厳格化】あいまいマッチングを廃止し、完全一致のみを検証する
                 matched_keibajo_key = None
                 for k in list_data.keys():
-                    if k in keibajo_name or keibajo_name in k:
+                    if k and (k == keibajo_name or k in keibajo_name):
                         matched_keibajo_key = k
                         break
 
+                track_type = ""
+                distance_num = ""
+
                 m_race_num = re.search(r'\d+', race_num)
-                track_type = "芝"
-                distance_num = "1200"
 
                 if matched_keibajo_key and 'races' in list_data[matched_keibajo_key]:
                     keibajo_name = matched_keibajo_key
@@ -580,6 +576,17 @@ def handle_image(event):
                         m_dist = re.search(r'\d+', target_condition)
                         if m_dist:
                             distance_num = m_dist.group(0)
+
+                # 【厳格ガード2】スプレッドシートデータから条件が引き抜けなかった場合は強行せず安全停止
+                if not track_type or not distance_num:
+                    reply_text = (
+                        f"⚠️ [{keibajo_name}{race_num}] のコース条件をスプレッドシートから引き抜けませんでした。\n"
+                        f"本日の【{keibajo_name}競馬場 全レース一覧】画像をLINEに送信して記録させてから、再度送信してください。"
+                    )
+                    with ApiClient(configuration) as api_client_inner:
+                        m_api = MessagingApi(api_client_inner)
+                        m_api.reply_message(ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)]))
+                    return
 
                 baba_context_str = "【記憶されている本日のリアルタイム馬場・コース情報】\n"
                 if baba_data:
@@ -614,7 +621,6 @@ def handle_image(event):
                     f"※画像の見た目や誤認識に惑わされず、上記【{keibajo_name}{race_num} {track_type}{distance_num}m】を100%正解としてタイトルおよび分析文の前提に適用すること。\n\n"
                 )
 
-                # 出馬表の分析には、ノイズを排除した「加工済み画像（proc_imgs）」を使用する
                 prompt = (
                     "送られた全ての出馬表画像（1枚または複数枚）を解析してください。\n"
                     "【最重要原則】\n"
