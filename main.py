@@ -204,39 +204,32 @@ def fetch_race_list_from_gas():
                 raw_data = res_json.get('data', [])
                 processed_dict = {}
 
-                def parse_item(item):
-                    if isinstance(item, str):
+                def process_entry(obj):
+                    if isinstance(obj, str):
                         try:
-                            item = json.loads(item)
+                            obj = json.loads(obj)
                         except Exception:
-                            return None
-                    return item
+                            return
+                    if isinstance(obj, dict):
+                        if 'keibajo' in obj and 'races' in obj:
+                            kj = str(obj.get('keibajo')).strip()
+                            kai = str(obj.get('kai', '')).strip()
+                            nichi = str(obj.get('nichi', '')).strip()
+                            course_info = get_course_info(kj, kai, nichi) if kai and nichi else "開催区分"
+                            processed_dict[kj] = {
+                                'races': obj.get('races', {}),
+                                'course_info': course_info
+                            }
+                        else:
+                            for v in obj.values():
+                                process_entry(v)
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            process_entry(item)
 
-                if isinstance(raw_data, list):
-                    for row in raw_data:
-                        parsed_row = parse_item(row)
-                        if not parsed_row:
-                            continue
+                process_entry(raw_data)
+                return processed_dict
 
-                        if isinstance(parsed_row, dict):
-                            target_val = parsed_row.get('コース一覧JSONデータ') or parsed_row.get('data') or parsed_row
-                            target_dict = parse_item(target_val) if isinstance(target_val, str) else target_val
-
-                            if isinstance(target_dict, dict) and 'keibajo' in target_dict:
-                                kj = str(target_dict.get('keibajo')).strip()
-                                kai = str(target_dict.get('kai', '')).strip()
-                                nichi = str(target_dict.get('nichi', '')).strip()
-                                course_info = get_course_info(kj, kai, nichi) if kai and nichi else "開催区分"
-
-                                processed_dict[kj] = {
-                                    'races': target_dict.get('races', {}),
-                                    'course_info': course_info
-                                }
-
-                    return processed_dict
-
-                elif isinstance(raw_data, dict):
-                    return raw_data
     except Exception as e:
         logging.error(f"Failed to fetch race_list info from GAS: {e}")
     return {}
