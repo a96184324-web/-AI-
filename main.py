@@ -201,9 +201,44 @@ def fetch_race_list_from_gas():
         if response.status_code == 200:
             res_json = response.json()
             if isinstance(res_json, dict) and res_json.get('status') == 'SUCCESS':
-                data = res_json.get('data', {})
-                if isinstance(data, dict):
-                    return data
+                raw_data = res_json.get('data', [])
+                processed_dict = {}
+
+                # GASから送られてくる配列構造・文字列構造を解析して辞書型へ安全変換
+                if isinstance(raw_data, list):
+                    for item in raw_data:
+                        target_obj = item
+                        if isinstance(item, str):
+                            try:
+                                target_obj = json.loads(item)
+                            except Exception:
+                                continue
+
+                        if isinstance(target_obj, dict):
+                            # スプレッドシートの「コース一覧JSONデータ」列に含まれるJSON文字列を展開
+                            json_str = target_obj.get('コース一覧JSONデータ') or target_obj.get('data')
+                            if isinstance(json_str, str):
+                                try:
+                                    parsed_data = json.loads(json_str)
+                                    kj = parsed_data.get('keibajo')
+                                    if kj:
+                                        kai = parsed_data.get('kai', '')
+                                        nichi = parsed_data.get('nichi', '')
+                                        course_info = get_course_info(kj, kai, nichi) if kai and nichi else "開催区分"
+                                        processed_dict[str(kj).strip()] = {
+                                            'races': parsed_data.get('races', {}),
+                                            'course_info': course_info
+                                        }
+                                except Exception:
+                                    pass
+                            elif target_obj.get('keibajo'):
+                                kj = str(target_obj.get('keibajo')).strip()
+                                processed_dict[kj] = target_obj
+
+                    return processed_dict
+
+                elif isinstance(raw_data, dict):
+                    return raw_data
     except Exception as e:
         logging.error(f"Failed to fetch race_list info from GAS: {e}")
     return {}
@@ -505,7 +540,7 @@ def handle_image(event):
                         list_data = gas_list
                         save_json_file(RACE_LIST_FILE, list_data)
 
-                # レース情報抽出：画像にない文字を捏造・空埋めすることを固く禁止する
+                # レース情報抽出プロンプト
                 race_info_prompt = (
                     "送られた画像内に印字されている『競馬場名』と『レース番号』を、視覚的に文字をそのまま抽出してください。\n"
                     "【絶対厳守ルール：ハルシネーション・忖度禁止】\n"
@@ -544,7 +579,7 @@ def handle_image(event):
                         m_api.reply_message(ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)]))
                     return
 
-                # 【厳格化】あいまいマッチングを廃止し、完全一致のみを検証する
+                # 【厳格化】あいまいマッチングを廃止し、完全一致または包含関係のみを検証
                 matched_keibajo_key = None
                 for k in list_data.keys():
                     if k and (k == keibajo_name or k in keibajo_name):
