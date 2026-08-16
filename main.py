@@ -204,41 +204,32 @@ def fetch_race_list_from_gas():
                 raw_data = res_json.get('data', [])
                 processed_dict = {}
 
-                # GASから送られてくる配列構造・文字列構造を解析して辞書型へ安全変換
-                if isinstance(raw_data, list):
-                    for item in raw_data:
-                        target_obj = item
-                        if isinstance(item, str):
-                            try:
-                                target_obj = json.loads(item)
-                            except Exception:
-                                continue
+                # 【完全対応】どんなデータ構造（配列・辞書・JSON文字列）で届いても再帰的に解析する
+                def extract_and_register(val):
+                    if isinstance(val, str):
+                        try:
+                            val = json.loads(val)
+                        except Exception:
+                            return
+                    if isinstance(val, dict):
+                        if 'keibajo' in val and 'races' in val:
+                            kj = str(val.get('keibajo')).strip()
+                            kai = str(val.get('kai', '')).strip()
+                            nichi = str(val.get('nichi', '')).strip()
+                            course_info = get_course_info(kj, kai, nichi) if kai and nichi else "開催区分"
+                            processed_dict[kj] = {
+                                'races': val.get('races', {}),
+                                'course_info': course_info
+                            }
+                        else:
+                            for v in val.values():
+                                extract_and_register(v)
+                    elif isinstance(val, list):
+                        for item in val:
+                            extract_and_register(item)
 
-                        if isinstance(target_obj, dict):
-                            # スプレッドシートの「コース一覧JSONデータ」列に含まれるJSON文字列を展開
-                            json_str = target_obj.get('コース一覧JSONデータ') or target_obj.get('data')
-                            if isinstance(json_str, str):
-                                try:
-                                    parsed_data = json.loads(json_str)
-                                    kj = parsed_data.get('keibajo')
-                                    if kj:
-                                        kai = parsed_data.get('kai', '')
-                                        nichi = parsed_data.get('nichi', '')
-                                        course_info = get_course_info(kj, kai, nichi) if kai and nichi else "開催区分"
-                                        processed_dict[str(kj).strip()] = {
-                                            'races': parsed_data.get('races', {}),
-                                            'course_info': course_info
-                                        }
-                                except Exception:
-                                    pass
-                            elif target_obj.get('keibajo'):
-                                kj = str(target_obj.get('keibajo')).strip()
-                                processed_dict[kj] = target_obj
-
-                    return processed_dict
-
-                elif isinstance(raw_data, dict):
-                    return raw_data
+                extract_and_register(raw_data)
+                return processed_dict
     except Exception as e:
         logging.error(f"Failed to fetch race_list info from GAS: {e}")
     return {}
