@@ -203,6 +203,7 @@ def fetch_trend_from_gas():
     return {}
 
 def fetch_race_list_from_gas():
+    """成功していたコード通りの再帰的パース処理"""
     if not GAS_WEBAPP_URL:
         return {}
     for attempt in range(3):
@@ -246,19 +247,7 @@ def fetch_race_list_from_gas():
                                             'course_info': course_info
                                         }
                             else:
-                                for k, v in obj.items():
-                                    clean_k = clean_text(k)
-                                    if any(kj in clean_k for kj in JRA_KEIBAJO_LIST):
-                                        kj_match = next((kj for kj in JRA_KEIBAJO_LIST if kj in clean_k), clean_k)
-                                        if isinstance(v, dict) and 'races' in v:
-                                            r_data = force_parse_json(v.get('races', {}))
-                                            if isinstance(r_data, dict):
-                                                c_races = {clean_text(rk): clean_text(rv) for rk, rv in r_data.items()}
-                                                processed_dict[kj_match] = {
-                                                    'races': c_races,
-                                                    'course_info': v.get('course_info', '開催区分')
-                                                }
-                                                continue
+                                for v in obj.values():
                                     extract_race_objects(v)
                         elif isinstance(obj, list):
                             for item in obj:
@@ -273,41 +262,37 @@ def fetch_race_list_from_gas():
     return {}
 
 def resolve_course_condition(keibajo_name, race_num_only, list_data, raw_imgs):
-    def search_in_dict(target_dict):
-        if not isinstance(target_dict, dict):
-            return "", ""
-        for k, v in target_dict.items():
-            clean_k = clean_text(k)
-            if clean_k and (clean_k in keibajo_name or keibajo_name in clean_k):
-                races_dict = {}
-                if isinstance(v, dict):
-                    races_dict = force_parse_json(v.get('races', {}))
-                elif isinstance(v, str):
-                    races_dict = force_parse_json(v)
-
-                if isinstance(races_dict, dict):
-                    for r_key, cond_str in races_dict.items():
-                        clean_r_key = clean_text(r_key)
-                        m_key = re.search(r'(\d+)', clean_r_key)
-                        if m_key and m_key.group(1) == str(race_num_only):
-                            cond = str(cond_str)
-                            tt = ""
-                            if "ダ" in cond or "だ" in cond:
-                                tt = "ダート"
-                            elif "芝" in cond or "し" in cond:
-                                tt = "芝"
-                            m_dist = re.search(r'(\d+)', cond)
-                            dist = m_dist.group(1) if m_dist else ""
-                            if tt and dist:
-                                return tt, dist
+    """成功していたコード通りのシンプルかつ確実な照合ロジック"""
+    def find_in_races(races_input):
+        races_dict = force_parse_json(races_input)
+        if isinstance(races_dict, dict):
+            for r_key, cond_str in races_dict.items():
+                clean_r_key = clean_text(r_key)
+                m_key = re.search(r'(\d+)', clean_r_key)
+                if m_key and m_key.group(1) == str(race_num_only):
+                    cond = str(cond_str)
+                    tt = ""
+                    if "ダ" in cond or "だ" in cond:
+                        tt = "ダート"
+                    elif "芝" in cond or "し" in cond:
+                        tt = "芝"
+                    m_dist = re.search(r'(\d+)', cond)
+                    dist = m_dist.group(1) if m_dist else ""
+                    if tt and dist:
+                        return tt, dist
         return "", ""
 
-    # Tier 1: ローカルキャッシュから照合
-    tt, dist = search_in_dict(list_data)
-    if tt and dist:
-        return tt, dist
+    # Tier 1: ローカル検索
+    if isinstance(list_data, dict):
+        for k, v in list_data.items():
+            clean_k = clean_text(k)
+            if clean_k and (clean_k == keibajo_name or clean_k in keibajo_name or keibajo_name in clean_k):
+                if isinstance(v, dict) and 'races' in v:
+                    tt, dist = find_in_races(v['races'])
+                    if tt and dist:
+                        return tt, dist
 
-    # Tier 2: GASから最新データを自動同期して再照合（スリープ/再起動時のリカバリ）
+    # Tier 2: GASから全件取得して検索
     gas_list = fetch_race_list_from_gas()
     if isinstance(gas_list, dict) and gas_list:
         if isinstance(list_data, dict):
@@ -316,15 +301,19 @@ def resolve_course_condition(keibajo_name, race_num_only, list_data, raw_imgs):
             list_data = gas_list
         save_json_file(RACE_LIST_FILE, list_data)
 
-        tt, dist = search_in_dict(list_data)
-        if tt and dist:
-            return tt, dist
+        for k, v in list_data.items():
+            clean_k = clean_text(k)
+            if clean_k and (clean_k == keibajo_name or clean_k in keibajo_name or keibajo_name in clean_k):
+                if isinstance(v, dict) and 'races' in v:
+                    tt, dist = find_in_races(v['races'])
+                    if tt and dist:
+                        return tt, dist
 
     # Tier 3: 出馬表画像からの直接OCRフォールバック
     try:
         ocr_prompt = (
-            f"送られた出馬表画像から、今回の対象レース（{keibajo_name}{race_num_only}R）のコース種別（芝またはダート）と距離（例：2600m）を特定してください。\n"
-            "過去走の欄や馬柱の注釈・ヘッダーから必ず数値を読み取り、以下のJSON形式のみで出力してください:\n"
+            f"送られた出馬表画像（馬の過去走成績欄など）から、対象レースのコース条件を読み取ってください。\n"
+            "以下のJSON形式のみで出力してください:\n"
             "{\"track_type\": \"芝\" または \"ダート\", \"distance\": \"数字のみ\"}"
         )
         res = ai_client.models.generate_content(
@@ -355,7 +344,7 @@ def get_course_info(keibajo, kai, nichi):
         kai_str = f"{kai}回"
         nichi_num = int(nichi)
         for master_kj, data in COURSE_MASTER.items():
-            if clean_text(master_kj) in keibajo or keibajo in clean_text(master_kj):
+            if clean_text(master_kj) == keibajo or master_kj in keibajo:
                 if kai_str in data:
                     for course, day_range in data[kai_str].items():
                         if nichi_num in day_range:
@@ -386,23 +375,6 @@ def save_json_file(filepath, dict_data):
             json.dump(data_to_save, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logging.error(f"Failed to save {filepath}: {e}")
-
-def ensure_gas_data_synced():
-    """スリープ解除やローカル消去時に、GASから最新データを全自動で復元する関数"""
-    baba = load_json_file(BABA_FILE)
-    if not baba:
-        g_baba = fetch_baba_from_gas()
-        if g_baba: save_json_file(BABA_FILE, g_baba)
-
-    trend = load_json_file(TREND_FILE)
-    if not trend:
-        g_trend = fetch_trend_from_gas()
-        if g_trend: save_json_file(TREND_FILE, g_trend)
-
-    r_list = load_json_file(RACE_LIST_FILE)
-    if not r_list:
-        g_list = fetch_race_list_from_gas()
-        if g_list: save_json_file(RACE_LIST_FILE, g_list)
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -476,9 +448,6 @@ def handle_image(event):
 
                 if not imgs_data or not r_token:
                     return
-
-                # 画像受信用スレッド冒頭で、スリープ等によるローカルデータ消失を全自動復元
-                ensure_gas_data_synced()
 
                 raw_imgs = [item[0] for item in imgs_data]
                 proc_imgs = [item[1] for item in imgs_data]
@@ -663,7 +632,19 @@ def handle_image(event):
 
                 # RACE (メイン予想ロジック)
                 baba_data = load_json_file(BABA_FILE)
+                if not baba_data:
+                    gas_baba = fetch_baba_from_gas()
+                    if gas_baba:
+                        baba_data = gas_baba
+                        save_json_file(BABA_FILE, baba_data)
+
                 trend_data = load_json_file(TREND_FILE)
+                if not trend_data:
+                    gas_trend = fetch_trend_from_gas()
+                    if gas_trend:
+                        trend_data = gas_trend
+                        save_json_file(TREND_FILE, trend_data)
+
                 list_data = load_json_file(RACE_LIST_FILE)
 
                 header_ocr_prompt = (
@@ -702,7 +683,7 @@ def handle_image(event):
                         m_api.reply_message(ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)]))
                     return
 
-                # 3段階解決ロジック（ローカル -> GAS最新同期 -> 画像OCR直接読み取り）
+                # 3段階解決ロジック（ローカル -> GAS全件取得 -> 画像OCR直接読み取り）
                 track_type, distance_num = resolve_course_condition(keibajo_name, race_num_only, list_data, raw_imgs)
 
                 if not track_type or not distance_num:
