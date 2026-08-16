@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import threading
+import unicodedata
 from flask import Flask, abort, request
 from google import genai
 from google.genai import types
@@ -59,6 +60,31 @@ COURSE_MASTER = {
     "阪神": {"1回": {"A": range(1, 9)}, "2回": {"A": range(1, 5), "B": range(5, 9)}, "3回": {"A": range(1, 9)}},
     "小倉": {"1回": {"A": range(1, 7)}, "2回": {"A": range(1, 7)}, "3回": {"A": range(1, 9)}}
 }
+
+def clean_text(text):
+    if not text:
+        return ""
+    text = unicodedata.normalize('NFKC', str(text))
+    return re.sub(r'\s+', '', text).strip()
+
+def deep_parse_json(data):
+    if isinstance(data, str):
+        cleaned = data.strip()
+        if (cleaned.startswith('{') and cleaned.endswith('}')) or (cleaned.startswith('[') and cleaned.endswith(']')):
+            try:
+                parsed = json.loads(cleaned)
+                return deep_parse_json(parsed)
+            except Exception:
+                return data
+        return data
+    elif isinstance(data, dict):
+        new_dict = {}
+        for k, v in data.items():
+            new_dict[clean_text(k) if isinstance(k, str) else k] = deep_parse_json(v)
+        return new_dict
+    elif isinstance(data, list):
+        return [deep_parse_json(item) for item in data]
+    return data
 
 def get_jst_today():
     try:
@@ -129,7 +155,7 @@ def fetch_past_results_from_gas(keibajo="", track_type="", distance=""):
             timeout=15
         )
         if response.status_code == 200:
-            res_json = response.json()
+            res_json = deep_parse_json(response.json())
             if isinstance(res_json, dict) and res_json.get('status') == 'SUCCESS':
                 return str(res_json.get('data', ''))
     except Exception as e:
@@ -151,7 +177,7 @@ def fetch_baba_from_gas():
             timeout=15
         )
         if response.status_code == 200:
-            res_json = response.json()
+            res_json = deep_parse_json(response.json())
             if isinstance(res_json, dict) and res_json.get('status') == 'SUCCESS':
                 data = res_json.get('data', {})
                 if isinstance(data, dict):
@@ -175,7 +201,7 @@ def fetch_trend_from_gas():
             timeout=15
         )
         if response.status_code == 200:
-            res_json = response.json()
+            res_json = deep_parse_json(response.json())
             if isinstance(res_json, dict) and res_json.get('status') == 'SUCCESS':
                 data = res_json.get('data', {})
                 if isinstance(data, dict):
@@ -199,35 +225,33 @@ def fetch_race_list_from_gas():
             timeout=15
         )
         if response.status_code == 200:
-            res_json = response.json()
+            res_json = deep_parse_json(response.json())
             if isinstance(res_json, dict) and res_json.get('status') == 'SUCCESS':
                 raw_data = res_json.get('data', [])
                 processed_dict = {}
 
-                def process_entry(obj):
-                    if isinstance(obj, str):
-                        try:
-                            obj = json.loads(obj)
-                        except Exception:
-                            return
+                def extract_race_objects(obj):
                     if isinstance(obj, dict):
                         if 'keibajo' in obj and 'races' in obj:
-                            kj = str(obj.get('keibajo')).strip()
-                            kai = str(obj.get('kai', '')).strip()
-                            nichi = str(obj.get('nichi', '')).strip()
-                            course_info = get_course_info(kj, kai, nichi) if kai and nichi else "開催区分"
-                            processed_dict[kj] = {
-                                'races': obj.get('races', {}),
-                                'course_info': course_info
-                            }
+                            kj = clean_text(str(obj.get('keibajo')))
+                            kai = clean_text(str(obj.get('kai', '')))
+                            nichi = clean_text(str(obj.get('nichi', '')))
+                            races = obj.get('races', {})
+                            if isinstance(races, dict):
+                                cleaned_races = {clean_text(k): clean_text(v) for k, v in races.items()}
+                                course_info = get_course_info(kj, kai, nichi) if kai and nichi else "開催区分"
+                                processed_dict[kj] = {
+                                    'races': cleaned_races,
+                                    'course_info': course_info
+                                }
                         else:
                             for v in obj.values():
-                                process_entry(v)
+                                extract_race_objects(v)
                     elif isinstance(obj, list):
                         for item in obj:
-                            process_entry(item)
+                            extract_race_objects(item)
 
-                process_entry(raw_data)
+                extract_race_objects(raw_data)
                 return processed_dict
 
     except Exception as e:
@@ -238,8 +262,9 @@ def get_course_info(keibajo, kai, nichi):
     try:
         kai_str = f"{kai}回"
         nichi_num = int(nichi)
-        if keibajo in COURSE_MASTER and kai_str in COURSE_MASTER[keibajo]:
-            for course, day_range in COURSE_MASTER[keibajo][kai_str].items():
+        clean_kj = clean_text(keibajo)
+        if clean_kj in COURSE_MASTER and kai_str in COURSE_MASTER[clean_kj]:
+            for course, day_range in COURSE_MASTER[clean_kj][kai_str].items():
                 if nichi_num in day_range:
                     return f"{course}コース（開幕{nichi_num}日目）"
     except Exception as e:
@@ -251,6 +276,7 @@ def load_json_file(filepath):
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+                data = deep_parse_json(data)
                 if isinstance(data, dict) and data.get('date') == get_jst_today():
                     return data.get('data', {})
         except Exception as e:
@@ -365,7 +391,7 @@ def handle_image(event):
                             config=deterministic_config
                         )
                         if res and res.text:
-                            text_upper = str(res.text).strip().upper()
+                            text_upper = clean_text(res.text).upper()
                             if 'LIST' in text_upper:
                                 image_type = 'LIST'
                             elif 'BABA' in text_upper:
@@ -392,20 +418,25 @@ def handle_image(event):
                             )
                             if res and res.text:
                                 raw_text = str(res.text).replace('```json', '').replace('```', '').strip()
-                                list_json = json.loads(raw_text)
+                                list_json = deep_parse_json(raw_text)
                                 break
                         except Exception:
                             continue
 
                     if isinstance(list_json, dict) and list_json.get('keibajo'):
-                        keibajo = str(list_json.get('keibajo')).strip()
-                        kai = str(list_json.get('kai', '')).strip()
-                        nichi = str(list_json.get('nichi', '')).strip()
+                        keibajo = clean_text(str(list_json.get('keibajo')))
+                        kai = clean_text(str(list_json.get('kai', '')))
+                        nichi = clean_text(str(list_json.get('nichi', '')))
                         course_info = get_course_info(keibajo, kai, nichi) if kai and nichi else "開催区分"
+
+                        races_input = list_json.get('races', {})
+                        cleaned_races_input = {}
+                        if isinstance(races_input, dict):
+                            cleaned_races_input = {clean_text(k): clean_text(v) for k, v in races_input.items()}
 
                         current_list = load_json_file(RACE_LIST_FILE)
                         current_list[keibajo] = {
-                            'races': list_json.get('races', {}),
+                            'races': cleaned_races_input,
                             'course_info': course_info
                         }
                         save_json_file(RACE_LIST_FILE, current_list)
@@ -435,18 +466,18 @@ def handle_image(event):
                             )
                             if res and res.text:
                                 raw_text = str(res.text).replace('```json', '').replace('```', '').strip()
-                                baba_json = json.loads(raw_text)
+                                baba_json = deep_parse_json(raw_text)
                                 break
                         except Exception:
                             continue
 
                     if isinstance(baba_json, dict) and baba_json.get('keibajo') and baba_json.get('keibajo') != "不明":
-                        keibajo = str(baba_json.get('keibajo')).strip()
+                        keibajo = clean_text(str(baba_json.get('keibajo')))
                         current_baba = load_json_file(BABA_FILE)
                         current_baba[keibajo] = {
-                            'tenko': str(baba_json.get('tenko', '不明')),
-                            'shiba': str(baba_json.get('shiba', '不明')),
-                            'dirt': str(baba_json.get('dirt', '不明'))
+                            'tenko': clean_text(str(baba_json.get('tenko', '不明'))),
+                            'shiba': clean_text(str(baba_json.get('shiba', '不明'))),
+                            'dirt': clean_text(str(baba_json.get('dirt', '不明')))
                         }
                         save_json_file(BABA_FILE, current_baba)
                         send_to_gas_async('save_baba', baba_json)
@@ -454,9 +485,9 @@ def handle_image(event):
                         reply_text = (
                             f"【本日の馬場情報を更新・記憶しました】\n"
                             f"📍 競馬場：【{keibajo}競馬場】\n"
-                            f"🌤 天候：{baba_json.get('tenko', '不明')}\n"
-                            f"🌿 芝：{baba_json.get('shiba', '不明')}\n"
-                            f"🟫 ダート：{baba_json.get('dirt', '不明')}"
+                            f"🌤 天候：{current_baba[keibajo]['tenko']}\n"
+                            f"🌿 芝：{current_baba[keibajo]['shiba']}\n"
+                            f"🟫 ダート：{current_baba[keibajo]['dirt']}"
                         )
                     else:
                         reply_text = "⚠️ 馬場情報の読み取りに失敗しました。もう一度送信してください。"
@@ -482,13 +513,13 @@ def handle_image(event):
                             )
                             if res and res.text:
                                 raw_text = str(res.text).replace('```json', '').replace('```', '').strip()
-                                trend_json = json.loads(raw_text)
+                                trend_json = deep_parse_json(raw_text)
                                 break
                         except Exception:
                             continue
 
                     if isinstance(trend_json, dict) and trend_json.get('keibajo') and trend_json.get('keibajo') != "不明":
-                        keibajo = str(trend_json.get('keibajo')).strip()
+                        keibajo = clean_text(str(trend_json.get('keibajo')))
                         summary_str = str(trend_json.get('summary', ''))
                         current_trend = load_json_file(TREND_FILE)
                         current_trend[keibajo] = {
@@ -545,14 +576,15 @@ def handle_image(event):
                         )
                         if info_res and info_res.text:
                             raw_i = str(info_res.text).replace('```json', '').replace('```', '').strip()
-                            info_json = json.loads(raw_i)
-                            keibajo_name = str(info_json.get('keibajo', '不明')).strip()
-                            raw_r = str(info_json.get('race_num', '不明')).strip()
-                            if raw_r != "不明" and not raw_r.endswith('R'):
-                                race_num = f"{raw_r}R"
-                            else:
-                                race_num = raw_r
-                            break
+                            info_json = deep_parse_json(raw_i)
+                            if isinstance(info_json, dict):
+                                keibajo_name = clean_text(str(info_json.get('keibajo', '不明')))
+                                raw_r = clean_text(str(info_json.get('race_num', '不明')))
+                                if raw_r != "不明" and not raw_r.endswith('R'):
+                                    race_num = f"{raw_r}R"
+                                else:
+                                    race_num = raw_r
+                                break
                     except Exception:
                         continue
 
@@ -566,11 +598,11 @@ def handle_image(event):
                 matched_keibajo_key = None
                 if isinstance(list_data, dict):
                     for k in list_data.keys():
-                        if k and (k == keibajo_name or k in keibajo_name):
+                        clean_k = clean_text(k)
+                        if clean_k and (clean_k == keibajo_name or clean_k in keibajo_name or keibajo_name in clean_k):
                             matched_keibajo_key = k
                             break
 
-                # 【修正ポイント】ローカルに該当競馬場がない場合、即座にGASから全データを取得してマージ・同期する
                 if not matched_keibajo_key:
                     gas_list = fetch_race_list_from_gas()
                     if isinstance(gas_list, dict) and gas_list:
@@ -581,7 +613,8 @@ def handle_image(event):
                         save_json_file(RACE_LIST_FILE, list_data)
                         
                         for k in list_data.keys():
-                            if k and (k == keibajo_name or k in keibajo_name):
+                            clean_k = clean_text(k)
+                            if clean_k and (clean_k == keibajo_name or clean_k in keibajo_name or keibajo_name in clean_k):
                                 matched_keibajo_key = k
                                 break
 
@@ -595,11 +628,13 @@ def handle_image(event):
                     races_dict = list_data[matched_keibajo_key].get('races', {})
                     target_condition = None
 
-                    for r_key, cond_str in races_dict.items():
-                        m_key = re.search(r'\d+', str(r_key))
-                        if m_key and m_race_num and m_key.group(0) == m_race_num.group(0):
-                            target_condition = str(cond_str)
-                            break
+                    if isinstance(races_dict, dict):
+                        for r_key, cond_str in races_dict.items():
+                            clean_r_key = clean_text(r_key)
+                            m_key = re.search(r'\d+', clean_r_key)
+                            if m_key and m_race_num and m_key.group(0) == m_race_num.group(0):
+                                target_condition = str(cond_str)
+                                break
 
                     if target_condition:
                         if "ダ" in target_condition:
