@@ -223,7 +223,7 @@ def fetch_race_list_from_gas():
                     def extract_race_objects(obj):
                         if isinstance(obj, str):
                             parsed = force_parse_json(obj)
-                            if isinstance(parsed, (dict, list)):
+                            if isinstance(parsed, (dict, list)) and parsed != obj:
                                 extract_race_objects(parsed)
                             return
 
@@ -232,10 +232,7 @@ def fetch_race_list_from_gas():
                                 kj = clean_text(str(obj.get('keibajo')))
                                 kai = clean_text(str(obj.get('kai', '')))
                                 nichi = clean_text(str(obj.get('nichi', '')))
-                                races = obj.get('races', {})
-                                
-                                if isinstance(races, str):
-                                    races = force_parse_json(races)
+                                races = force_parse_json(obj.get('races', {}))
                                 
                                 if isinstance(races, dict):
                                     cleaned_races = {clean_text(k): clean_text(v) for k, v in races.items()}
@@ -262,6 +259,88 @@ def fetch_race_list_from_gas():
         except Exception as e:
             logging.error(f"Failed to fetch race_list info from GAS (Attempt {attempt+1}): {e}")
     return {}
+
+def resolve_course_condition(keibajo_name, race_num_only, list_data, raw_imgs):
+    """
+    1. ローカルデータから探す
+    2. 見つからなければGASから強制再取得して探す
+    3. それでも見つからなければ送信画像（出馬表）から直接OCR抽出する（フォールバック）
+    """
+    def find_in_races(races_input):
+        races_dict = force_parse_json(races_input)
+        if isinstance(races_dict, dict):
+            for r_key, cond_str in races_dict.items():
+                clean_r_key = clean_text(r_key)
+                m_key = re.search(r'(\d+)', clean_r_key)
+                if m_key and m_key.group(1) == str(race_num_only):
+                    cond = str(cond_str)
+                    tt = ""
+                    if "ダ" in cond or "だ" in cond:
+                        tt = "ダート"
+                    elif "芝" in cond or "し" in cond:
+                        tt = "芝"
+                    m_dist = re.search(r'(\d+)', cond)
+                    dist = m_dist.group(1) if m_dist else ""
+                    if tt and dist:
+                        return tt, dist
+        return "", ""
+
+    # Tier 1: ローカル検索
+    if isinstance(list_data, dict):
+        for k, v in list_data.items():
+            clean_k = clean_text(k)
+            if clean_k and (clean_k == keibajo_name or clean_k in keibajo_name or keibajo_name in clean_k):
+                if isinstance(v, dict) and 'races' in v:
+                    tt, dist = find_in_races(v['races'])
+                    if tt and dist:
+                        return tt, dist
+
+    # Tier 2: GASから強制再取得して検索
+    gas_list = fetch_race_list_from_gas()
+    if isinstance(gas_list, dict) and gas_list:
+        if isinstance(list_data, dict):
+            list_data.update(gas_list)
+        else:
+            list_data = gas_list
+        save_json_file(RACE_LIST_FILE, list_data)
+
+        for k, v in list_data.items():
+            clean_k = clean_text(k)
+            if clean_k and (clean_k == keibajo_name or clean_k in keibajo_name or keibajo_name in clean_k):
+                if isinstance(v, dict) and 'races' in v:
+                    tt, dist = find_in_races(v['races'])
+                    if tt and dist:
+                        return tt, dist
+
+    # Tier 3: 出馬表画像からの直接OCRフォールバック
+    try:
+        ocr_prompt = (
+            f"送られた出馬表画像（馬の過去走成績欄など）から、対象レースのコース条件を読み取ってください。\n"
+            "以下のJSON形式のみで出力してください:\n"
+            "{\"track_type\": \"芝\" または \"ダート\", \"distance\": \"数字のみ\"}"
+        )
+        res = ai_client.models.generate_content(
+            model='gemini-3.5-flash',
+            contents=raw_imgs + [ocr_prompt],
+            config=types.GenerateContentConfig(temperature=0.0)
+        )
+        if res and res.text:
+            raw_t = str(res.text).replace('```json', '').replace('```', '').strip()
+            extracted = force_parse_json(raw_t)
+            if isinstance(extracted, dict):
+                tt_ocr = str(extracted.get('track_type', ''))
+                dist_ocr = str(extracted.get('distance', ''))
+                if "ダ" in tt_ocr: tt_ocr = "ダート"
+                elif "芝" in tt_ocr: tt_ocr = "芝"
+                m_d = re.search(r'(\d+)', dist_ocr)
+                dist_ocr = m_d.group(1) if m_d else ""
+                if tt_ocr and dist_ocr:
+                    logging.info(f"Fallback OCR success: {tt_ocr}{dist_ocr}m")
+                    return tt_ocr, dist_ocr
+    except Exception as e:
+        logging.error(f"Fallback OCR error: {e}")
+
+    return "", ""
 
 def get_course_info(keibajo, kai, nichi):
     try:
@@ -408,9 +487,7 @@ def handle_image(event):
                     except Exception:
                         continue
 
-                # ==========================================
-                # LIST 画像の処理
-                # ==========================================
+                # LIST
                 if image_type == 'LIST':
                     extract_list_prompt = (
                         "この画像から【開催競馬場名】と【各レース(1R〜12R)のコース・距離・条件】、【開催節情報（例：1回〇〇4日）】を抽出し、以下のJSON形式のみで出力してください。\n"
@@ -461,9 +538,7 @@ def handle_image(event):
                         m_api.reply_message(ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)]))
                     return
 
-                # ==========================================
-                # BABA 画像の処理
-                # ==========================================
+                # BABA
                 elif image_type == 'BABA':
                     extract_baba_prompt = (
                         "この馬場情報画像から【競馬場名】、【天候】、【芝の馬場状態】、【ダートの馬場状態】を抽出し、以下のJSON形式のみで出力してください。\n"
@@ -512,9 +587,7 @@ def handle_image(event):
                         m_api.reply_message(ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)]))
                     return
 
-                # ==========================================
-                # TREND 画像の処理
-                # ==========================================
+                # TREND
                 elif image_type == 'TREND':
                     extract_trend_prompt = (
                         "送られた画像（本日の傾向：馬番・騎手・脚質画面）から【競馬場名】と【各レースの好走馬（脚質傾向・馬番傾向・好調騎手）】を抽出し、以下のJSON形式のみで出力してください。\n"
@@ -560,10 +633,7 @@ def handle_image(event):
                         m_api.reply_message(ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)]))
                     return
 
-                # ==========================================
-                # 出馬表（RACE）の解析とAI予想生成（メイン）
-                # ==========================================
-                
+                # RACE (メイン)
                 baba_data = load_json_file(BABA_FILE)
                 if not baba_data:
                     gas_baba = fetch_baba_from_gas()
@@ -580,7 +650,6 @@ def handle_image(event):
 
                 list_data = load_json_file(RACE_LIST_FILE)
 
-                # 【根本解決】ヘッダーテキストを丸ごと抽出し、正規表現で競馬場とレース番号を厳密解析
                 header_ocr_prompt = (
                     "画像最上部の緑色ヘッダーバーに印字されている文字（例: 『1回札幌8日 12R』）を、見たままそのまま文字として書き出してください。\n"
                     "回答はヘッダーの文字列のみとし、他の補足文は一切含めないでください。"
@@ -600,7 +669,6 @@ def handle_image(event):
                     except Exception:
                         continue
 
-                # 競馬場名の特定（10大競馬場リストから完全一致）
                 original_keibajo_name = "不明"
                 for kj_candidate in JRA_KEIBAJO_LIST:
                     if kj_candidate in raw_header_text:
@@ -608,8 +676,6 @@ def handle_image(event):
                         break
 
                 keibajo_name = clean_text(original_keibajo_name)
-
-                # レース番号の特定（Rの直前にある数字のみを正確に取得）
                 race_num_match = re.search(r'(\d+)\s*[Rr]', raw_header_text)
                 race_num_only = race_num_match.group(1) if race_num_match else ""
 
@@ -620,60 +686,13 @@ def handle_image(event):
                         m_api.reply_message(ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)]))
                     return
 
-                # 照合と不足時のGAS全件取得（あいまい検索）
-                matched_keibajo_key = None
-                if isinstance(list_data, dict):
-                    for k in list_data.keys():
-                        clean_k = clean_text(k)
-                        if clean_k and (clean_k == keibajo_name or clean_k in keibajo_name or keibajo_name in clean_k):
-                            matched_keibajo_key = k
-                            break
-
-                if not matched_keibajo_key:
-                    gas_list = fetch_race_list_from_gas()
-                    if isinstance(gas_list, dict) and gas_list:
-                        if isinstance(list_data, dict):
-                            list_data.update(gas_list)
-                        else:
-                            list_data = gas_list
-                        save_json_file(RACE_LIST_FILE, list_data)
-                        
-                        for k in list_data.keys():
-                            clean_k = clean_text(k)
-                            if clean_k and (clean_k == keibajo_name or clean_k in keibajo_name or keibajo_name in clean_k):
-                                matched_keibajo_key = k
-                                break
-
-                # コース種別と距離の特定
-                track_type = ""
-                distance_num = ""
-
-                if matched_keibajo_key and 'races' in list_data[matched_keibajo_key]:
-                    races_dict = list_data[matched_keibajo_key].get('races', {})
-                    target_condition = None
-
-                    if isinstance(races_dict, dict):
-                        for r_key, cond_str in races_dict.items():
-                            clean_r_key = clean_text(r_key)
-                            m_key = re.search(r'(\d+)', clean_r_key)
-                            if m_key and m_key.group(1) == race_num_only:
-                                target_condition = str(cond_str)
-                                break
-
-                    if target_condition:
-                        if "ダ" in target_condition or "だ" in target_condition:
-                            track_type = "ダート"
-                        elif "芝" in target_condition or "し" in target_condition:
-                            track_type = "芝"
-                        
-                        m_dist = re.search(r'(\d+)', target_condition)
-                        if m_dist:
-                            distance_num = m_dist.group(1)
+                # 強力な3段階解決ロジック（ローカル -> GAS最新同期 -> 画像OCR直接読み取り）
+                track_type, distance_num = resolve_course_condition(keibajo_name, race_num_only, list_data, raw_imgs)
 
                 if not track_type or not distance_num:
                     reply_text = (
-                        f"⚠️ [{original_keibajo_name}{race_num_only}R] のコース条件をスプレッドシートから引き抜けませんでした。\n"
-                        f"本日の【{original_keibajo_name}競馬場 全レース一覧】画像をLINEに送信して記録させてから、再度送信してください。"
+                        f"⚠️ [{original_keibajo_name}{race_num_only}R] のコース条件の特定に失敗しました。\n"
+                        f"お手数ですが、もう一度画像を送信してください。"
                     )
                     with ApiClient(configuration) as api_client_inner:
                         m_api = MessagingApi(api_client_inner)
@@ -696,7 +715,7 @@ def handle_image(event):
                 else:
                     trend_context_str += "・未設定（標準傾向として判定）\n"
 
-                past_results_str = fetch_past_results_from_gas(matched_keibajo_key, track_type, distance_num)
+                past_results_str = fetch_past_results_from_gas(original_keibajo_name, track_type, distance_num)
                 past_data_context = ""
                 if past_results_str:
                     past_data_context = (
