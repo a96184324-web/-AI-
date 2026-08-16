@@ -71,6 +71,7 @@ def get_jst_today():
 def process_image_for_ocr(image):
     try:
         w, h = image.size
+        # ここで上部18%をカットするため、JRAの緑ヘッダーが見えなくなっていた
         crop_top = int(h * 0.18)
         crop_bottom = int(h * 0.85)
         
@@ -293,23 +294,34 @@ def handle_image(event):
         try:
             blob_api = MessagingApiBlob(api_client)
             image_bytes = blob_api.get_message_content(message_id=msg_id)
+            
+            # 元画像（ヘッダー確認用：トリミングなし）
             raw_image = Image.open(io.BytesIO(image_bytes))
+            raw_for_header = raw_image.copy()
+            raw_for_header.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+            
+            # 解析用画像（出馬表本文用：上下トリミング・コントラスト補正済み）
             processed_image = process_image_for_ocr(raw_image)
 
             with buffer_lock:
-                image_buffer.append(processed_image)
+                # 生画像と加工済み画像の両方をセットで保存する
+                image_buffer.append((raw_for_header, processed_image))
                 latest_reply_token = event.reply_token
 
             def process_race_prediction():
                 global latest_reply_token, current_timer
                 with buffer_lock:
-                    imgs = list(image_buffer)
+                    imgs_data = list(image_buffer)
                     image_buffer.clear()
                     r_token = latest_reply_token
                     current_timer = None
 
-                if not imgs or not r_token:
+                if not imgs_data or not r_token:
                     return
+
+                # 用途に合わせて画像を分離
+                raw_imgs = [item[0] for item in imgs_data]
+                proc_imgs = [item[1] for item in imgs_data]
 
                 candidate_models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash']
                 deterministic_config = types.GenerateContentConfig(temperature=0.0)
@@ -323,11 +335,13 @@ def handle_image(event):
                     "・それ以外の『出馬表（馬名やオッズが並ぶ画面）』であれば \"RACE\" と答えてください。\n"
                     "回答は \"LIST\"、\"BABA\"、\"TREND\"、\"RACE\" の英字1単語のみにしてください。"
                 )
+                
+                # 画像種別の判定にはヘッダーが見える「生画像（raw_imgs）」を使用
                 for model_name in candidate_models:
                     try:
                         res = ai_client.models.generate_content(
                             model=model_name,
-                            contents=imgs + [classify_prompt],
+                            contents=raw_imgs + [classify_prompt],
                             config=deterministic_config
                         )
                         if res and res.text:
@@ -344,7 +358,7 @@ def handle_image(event):
 
                 if image_type == 'LIST':
                     extract_list_prompt = (
-                        "この画像から【開催競馬場名】と【各レース(1R〜12R)のコース・距離・条件】、【開催節情報（例：1回新潟4日）】を抽出し、以下のJSON形式のみで出力してください。\n"
+                        "この画像から【開催競馬場名】と【各レース(1R〜12R)のコース・距離・条件】、【開催節情報（例：1回〇〇4日）】を抽出し、以下のJSON形式のみで出力してください。\n"
                         "{\"keibajo\": \"競馬場名\", \"kai\": \"1\", \"nichi\": \"4\", \"races\": {\"1R\": \"ダ1700m\", \"2R\": \"芝1200m\"}}\n"
                         "※JSON以外の文字列は含めないでください。"
                     )
@@ -353,7 +367,7 @@ def handle_image(event):
                         try:
                             res = ai_client.models.generate_content(
                                 model=model_name,
-                                contents=[imgs[0], extract_list_prompt],
+                                contents=[raw_imgs[0], extract_list_prompt],
                                 config=deterministic_config
                             )
                             if res and res.text:
@@ -396,7 +410,7 @@ def handle_image(event):
                         try:
                             res = ai_client.models.generate_content(
                                 model=model_name,
-                                contents=[imgs[0], extract_baba_prompt],
+                                contents=[raw_imgs[0], extract_baba_prompt],
                                 config=deterministic_config
                             )
                             if res and res.text:
@@ -443,7 +457,7 @@ def handle_image(event):
                         try:
                             res = ai_client.models.generate_content(
                                 model=model_name,
-                                contents=imgs + [extract_trend_prompt],
+                                contents=raw_imgs + [extract_trend_prompt],
                                 config=deterministic_config
                             )
                             if res and res.text:
@@ -497,38 +511,44 @@ def handle_image(event):
                         list_data = gas_list
                         save_json_file(RACE_LIST_FILE, list_data)
 
-                # 特定の場名・数字によるバイアスを完全に排除した抽象化プロンプト
+                # レース情報の抽出には、ヘッダーが欠けていない「生画像（raw_imgs）」を使用する
                 race_info_prompt = (
-                    "送られた出馬表画像から【正確な競馬場名】と【正確なレース番号】を画像に印字されている文字通りに抽出してください。\n"
-                    "【絶対識別ルール】\n"
-                    "1. 画像ヘッダー（例: 『2回新潟8日 6R』や『1回中京2日 11R』など）から文字をそのまま正確に読み取ってください。\n"
-                    "2. 『〇日』や『〇日目』の『日』の直前にある数字は絶対レース番号として抽出しないでください。\n"
-                    "3. 必ず文字『R』の直前に直接ついている数字（例:『6R』なら『6』）のみを正確にレース番号として抽出すること。\n"
-                    "4. 上記以外の数字（日付、馬番、オッズ）はすべて無視してください。\n"
-                    "以下のJSON形式のみで出力してください。\n"
-                    "{\"keibajo\": \"画像から読み取った正確な競馬場名\", \"race_num\": \"数字+R\"}\n"
-                    "※JSON以外出力禁止。"
+                    "送られた画像内に印字されている『競馬場名』と『レース番号』を、視覚的に文字をそのまま抽出してください。\n"
+                    "【絶対厳守ルール：ハルシネーション・忖度禁止】\n"
+                    "1. 画像ヘッダーの表記（例: 『〇回〇〇〇日 △R』）から、〇〇の部分の競馬場名と、△の部分のレース番号のみをそのまま正確に読み取ってください。\n"
+                    "2. 画像内に文字が存在しない場合、あるいは確信が持てない場合は、無理に推測せず \"不明\" と答えてください。\n"
+                    "3. 以下のJSON形式のみで出力してください。\n"
+                    "{\"keibajo\": \"画像通りの競馬場名（不明な場合は不明）\", \"race_num\": \"画像通りの数字+R（不明な場合は不明）\"}\n"
+                    "※JSON以外の文字列は一切出力禁止。"
                 )
                 keibajo_name, race_num = "", ""
                 for m_name in candidate_models:
                     try:
                         info_res = ai_client.models.generate_content(
                             model=m_name,
-                            contents=imgs + [race_info_prompt],
+                            contents=raw_imgs + [race_info_prompt],
                             config=deterministic_config
                         )
                         if info_res and info_res.text:
                             raw_i = str(info_res.text).replace('```json', '').replace('```', '').strip()
                             info_json = json.loads(raw_i)
-                            keibajo_name = str(info_json.get('keibajo', '')).strip()
-                            raw_r = str(info_json.get('race_num', '')).strip()
-                            if raw_r and not raw_r.endswith('R'):
+                            keibajo_name = str(info_json.get('keibajo', '不明')).strip()
+                            raw_r = str(info_json.get('race_num', '不明')).strip()
+                            if raw_r != "不明" and not raw_r.endswith('R'):
                                 race_num = f"{raw_r}R"
                             else:
                                 race_num = raw_r
                             break
                     except Exception:
                         continue
+
+                # 【安全ガード】読み取り失敗時は強行せずにエラーで止める
+                if keibajo_name == "不明" or race_num == "不明":
+                    reply_text = "⚠️ 競馬場名またはレース番号が正しく読み取れませんでした。\nJRAの緑色のヘッダー（〇回〇〇〇日 △R）が画面に映っている状態でスクリーンショットを撮影し直して再送してください。"
+                    with ApiClient(configuration) as api_client_inner:
+                        m_api = MessagingApi(api_client_inner)
+                        m_api.reply_message(ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)]))
+                    return
 
                 matched_keibajo_key = None
                 for k in list_data.keys():
@@ -594,6 +614,7 @@ def handle_image(event):
                     f"※画像の見た目や誤認識に惑わされず、上記【{keibajo_name}{race_num} {track_type}{distance_num}m】を100%正解としてタイトルおよび分析文の前提に適用すること。\n\n"
                 )
 
+                # 出馬表の分析には、ノイズを排除した「加工済み画像（proc_imgs）」を使用する
                 prompt = (
                     "送られた全ての出馬表画像（1枚または複数枚）を解析してください。\n"
                     "【最重要原則】\n"
@@ -652,7 +673,7 @@ def handle_image(event):
                     "※馬券購入は自己責任でお願いします"
                 )
 
-                content_list = imgs + [prompt]
+                content_list = proc_imgs + [prompt]
                 reply_text = None
                 for model_name in candidate_models:
                     try:
