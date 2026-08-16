@@ -231,12 +231,20 @@ def fetch_race_list_from_gas():
                 processed_dict = {}
 
                 def extract_race_objects(obj):
+                    if isinstance(obj, str):
+                        parsed = deep_parse_json(obj)
+                        if isinstance(parsed, (dict, list)):
+                            extract_race_objects(parsed)
+                        return
+
                     if isinstance(obj, dict):
                         if 'keibajo' in obj and 'races' in obj:
                             kj = clean_text(str(obj.get('keibajo')))
                             kai = clean_text(str(obj.get('kai', '')))
                             nichi = clean_text(str(obj.get('nichi', '')))
                             races = obj.get('races', {})
+                            if isinstance(races, str):
+                                races = deep_parse_json(races)
                             if isinstance(races, dict):
                                 cleaned_races = {clean_text(k): clean_text(v) for k, v in races.items()}
                                 course_info = get_course_info(kj, kai, nichi) if kai and nichi else "開催区分"
