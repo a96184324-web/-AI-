@@ -94,20 +94,6 @@ def get_jst_today():
         logging.error(f"Date error: {e}")
         return datetime.datetime.now().strftime('%Y-%m-%d')
 
-def get_date_variations():
-    try:
-        jst = datetime.timezone(datetime.timedelta(hours=9))
-        now = datetime.datetime.now(jst)
-    except Exception:
-        now = datetime.datetime.now()
-    
-    return [
-        now.strftime('%Y-%m-%d'),
-        now.strftime('%Y.%m.%d'),
-        now.strftime('%Y/%m/%d'),
-        now.strftime('%Y%m%d')
-    ]
-
 def process_image_for_ocr(image):
     try:
         w, h = image.size
@@ -179,94 +165,86 @@ def fetch_past_results_from_gas(keibajo="", track_type="", distance=""):
 def fetch_baba_from_gas():
     if not GAS_WEBAPP_URL:
         return {}
-    for d_str in get_date_variations():
-        try:
-            payload = {'action': 'get_baba', 'date': d_str}
-            response = requests.post(GAS_WEBAPP_URL, data=json.dumps(payload), headers={'Content-Type': 'application/json'}, timeout=10)
-            if response.status_code == 200:
-                res_json = deep_parse_json(response.json())
-                if isinstance(res_json, dict) and res_json.get('status') == 'SUCCESS':
-                    data = res_json.get('data', {})
-                    if isinstance(data, dict) and data:
-                        return data
-        except Exception as e:
-            logging.error(f"Failed to fetch baba info from GAS ({d_str}): {e}")
+    try:
+        payload = {'action': 'get_baba', 'date': ''}
+        response = requests.post(GAS_WEBAPP_URL, data=json.dumps(payload), headers={'Content-Type': 'application/json'}, timeout=12)
+        if response.status_code == 200:
+            res_json = deep_parse_json(response.json())
+            if isinstance(res_json, dict) and res_json.get('status') == 'SUCCESS':
+                data = res_json.get('data', {})
+                if isinstance(data, dict):
+                    return data
+    except Exception as e:
+        logging.error(f"Failed to fetch baba info from GAS: {e}")
     return {}
 
 def fetch_trend_from_gas():
     if not GAS_WEBAPP_URL:
         return {}
-    for d_str in get_date_variations():
-        try:
-            payload = {'action': 'get_trend', 'date': d_str}
-            response = requests.post(GAS_WEBAPP_URL, data=json.dumps(payload), headers={'Content-Type': 'application/json'}, timeout=10)
-            if response.status_code == 200:
-                res_json = deep_parse_json(response.json())
-                if isinstance(res_json, dict) and res_json.get('status') == 'SUCCESS':
-                    data = res_json.get('data', {})
-                    if isinstance(data, dict) and data:
-                        return data
-        except Exception as e:
-            logging.error(f"Failed to fetch trend info from GAS ({d_str}): {e}")
+    try:
+        payload = {'action': 'get_trend', 'date': ''}
+        response = requests.post(GAS_WEBAPP_URL, data=json.dumps(payload), headers={'Content-Type': 'application/json'}, timeout=12)
+        if response.status_code == 200:
+            res_json = deep_parse_json(response.json())
+            if isinstance(res_json, dict) and res_json.get('status') == 'SUCCESS':
+                data = res_json.get('data', {})
+                if isinstance(data, dict):
+                    return data
+    except Exception as e:
+        logging.error(f"Failed to fetch trend info from GAS: {e}")
     return {}
 
 def fetch_race_list_from_gas():
     if not GAS_WEBAPP_URL:
         return {}
-    
-    date_list = get_date_variations() + [""]
-    
-    for d_str in date_list:
-        try:
-            payload = {'action': 'get_race_list', 'date': d_str}
-            response = requests.post(
-                GAS_WEBAPP_URL,
-                data=json.dumps(payload),
-                headers={'Content-Type': 'application/json'},
-                timeout=12
-            )
-            if response.status_code == 200:
-                res_json = deep_parse_json(response.json())
-                if isinstance(res_json, dict) and res_json.get('status') == 'SUCCESS':
-                    raw_data = res_json.get('data', [])
-                    processed_dict = {}
+    try:
+        payload = {'action': 'get_race_list', 'date': ''}
+        response = requests.post(
+            GAS_WEBAPP_URL,
+            data=json.dumps(payload),
+            headers={'Content-Type': 'application/json'},
+            timeout=15
+        )
+        if response.status_code == 200:
+            res_json = deep_parse_json(response.json())
+            if isinstance(res_json, dict) and res_json.get('status') == 'SUCCESS':
+                raw_data = res_json.get('data', [])
+                processed_dict = {}
 
-                    def extract_race_objects(obj):
-                        if isinstance(obj, str):
-                            parsed = deep_parse_json(obj)
-                            if isinstance(parsed, (dict, list)):
-                                extract_race_objects(parsed)
-                            return
+                def extract_race_objects(obj):
+                    if isinstance(obj, str):
+                        parsed = deep_parse_json(obj)
+                        if isinstance(parsed, (dict, list)):
+                            extract_race_objects(parsed)
+                        return
 
-                        if isinstance(obj, dict):
-                            if 'keibajo' in obj and 'races' in obj:
-                                kj = clean_text(str(obj.get('keibajo')))
-                                kai = clean_text(str(obj.get('kai', '')))
-                                nichi = clean_text(str(obj.get('nichi', '')))
-                                races = obj.get('races', {})
-                                if isinstance(races, str):
-                                    races = deep_parse_json(races)
-                                if isinstance(races, dict):
-                                    cleaned_races = {clean_text(k): clean_text(v) for k, v in races.items()}
-                                    course_info = get_course_info(kj, kai, nichi) if kai and nichi else "開催区分"
-                                    processed_dict[kj] = {
-                                        'races': cleaned_races,
-                                        'course_info': course_info
-                                    }
-                            else:
-                                for v in obj.values():
-                                    extract_race_objects(v)
-                        elif isinstance(obj, list):
-                            for item in obj:
-                                extract_race_objects(item)
+                    if isinstance(obj, dict):
+                        if 'keibajo' in obj and 'races' in obj:
+                            kj = clean_text(str(obj.get('keibajo')))
+                            kai = clean_text(str(obj.get('kai', '')))
+                            nichi = clean_text(str(obj.get('nichi', '')))
+                            races = obj.get('races', {})
+                            if isinstance(races, str):
+                                races = deep_parse_json(races)
+                            if isinstance(races, dict):
+                                cleaned_races = {clean_text(k): clean_text(v) for k, v in races.items()}
+                                course_info = get_course_info(kj, kai, nichi) if kai and nichi else "開催区分"
+                                processed_dict[kj] = {
+                                    'races': cleaned_races,
+                                    'course_info': course_info
+                                }
+                        else:
+                            for v in obj.values():
+                                extract_race_objects(v)
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            extract_race_objects(item)
 
-                    extract_race_objects(raw_data)
-                    if processed_dict:
-                        return processed_dict
+                extract_race_objects(raw_data)
+                return processed_dict
 
-        except Exception as e:
-            logging.error(f"Failed to fetch race_list info from GAS ({d_str}): {e}")
-            
+    except Exception as e:
+        logging.error(f"Failed to fetch race_list info from GAS: {e}")
     return {}
 
 def get_course_info(keibajo, kai, nichi):
