@@ -65,26 +65,26 @@ def clean_text(text):
     if not text:
         return ""
     text = unicodedata.normalize('NFKC', str(text))
-    return re.sub(r'\s+', '', text).strip()
+    return re.sub(r'\s+', '', text).strip().lower()
 
-def deep_parse_json(data):
-    if isinstance(data, str):
-        cleaned = data.strip()
-        if (cleaned.startswith('{') and cleaned.endswith('}')) or (cleaned.startswith('[') and cleaned.endswith(']')):
-            try:
-                parsed = json.loads(cleaned)
-                return deep_parse_json(parsed)
-            except Exception:
-                return data
+def force_parse_json(data):
+    """
+    GASから届いたデータが二重文字列化されていたり、エスケープされていても
+    限界までJSONデコードを試みる超強固な解凍関数
+    """
+    if not isinstance(data, str):
         return data
-    elif isinstance(data, dict):
-        new_dict = {}
-        for k, v in data.items():
-            new_dict[clean_text(k) if isinstance(k, str) else k] = deep_parse_json(v)
-        return new_dict
-    elif isinstance(data, list):
-        return [deep_parse_json(item) for item in data]
-    return data
+    try:
+        val = data.strip()
+        while (val.startswith('{') and val.endswith('}')) or (val.startswith('[') and val.endswith(']')):
+            parsed = json.loads(val)
+            if isinstance(parsed, str):
+                val = parsed.strip()
+            else:
+                return parsed
+        return val
+    except Exception:
+        return data
 
 def get_jst_today():
     try:
@@ -155,7 +155,7 @@ def fetch_past_results_from_gas(keibajo="", track_type="", distance=""):
             timeout=15
         )
         if response.status_code == 200:
-            res_json = deep_parse_json(response.json())
+            res_json = force_parse_json(response.json())
             if isinstance(res_json, dict) and res_json.get('status') == 'SUCCESS':
                 return str(res_json.get('data', ''))
     except Exception as e:
@@ -166,12 +166,20 @@ def fetch_baba_from_gas():
     if not GAS_WEBAPP_URL:
         return {}
     try:
-        payload = {'action': 'get_baba', 'date': ''}
-        response = requests.post(GAS_WEBAPP_URL, data=json.dumps(payload), headers={'Content-Type': 'application/json'}, timeout=12)
+        payload = {
+            'action': 'get_baba',
+            'date': ''  # 日付縛りをなくして最新データを引く
+        }
+        response = requests.post(
+            GAS_WEBAPP_URL,
+            data=json.dumps(payload),
+            headers={'Content-Type': 'application/json'},
+            timeout=15
+        )
         if response.status_code == 200:
-            res_json = deep_parse_json(response.json())
+            res_json = force_parse_json(response.json())
             if isinstance(res_json, dict) and res_json.get('status') == 'SUCCESS':
-                data = res_json.get('data', {})
+                data = force_parse_json(res_json.get('data', {}))
                 if isinstance(data, dict):
                     return data
     except Exception as e:
@@ -182,12 +190,20 @@ def fetch_trend_from_gas():
     if not GAS_WEBAPP_URL:
         return {}
     try:
-        payload = {'action': 'get_trend', 'date': ''}
-        response = requests.post(GAS_WEBAPP_URL, data=json.dumps(payload), headers={'Content-Type': 'application/json'}, timeout=12)
+        payload = {
+            'action': 'get_trend',
+            'date': ''  # 日付縛りをなくして最新データを引く
+        }
+        response = requests.post(
+            GAS_WEBAPP_URL,
+            data=json.dumps(payload),
+            headers={'Content-Type': 'application/json'},
+            timeout=15
+        )
         if response.status_code == 200:
-            res_json = deep_parse_json(response.json())
+            res_json = force_parse_json(response.json())
             if isinstance(res_json, dict) and res_json.get('status') == 'SUCCESS':
-                data = res_json.get('data', {})
+                data = force_parse_json(res_json.get('data', {}))
                 if isinstance(data, dict):
                     return data
     except Exception as e:
@@ -197,65 +213,81 @@ def fetch_trend_from_gas():
 def fetch_race_list_from_gas():
     if not GAS_WEBAPP_URL:
         return {}
-    try:
-        payload = {'action': 'get_race_list', 'date': ''}
-        response = requests.post(
-            GAS_WEBAPP_URL,
-            data=json.dumps(payload),
-            headers={'Content-Type': 'application/json'},
-            timeout=15
-        )
-        if response.status_code == 200:
-            res_json = deep_parse_json(response.json())
-            if isinstance(res_json, dict) and res_json.get('status') == 'SUCCESS':
-                raw_data = res_json.get('data', [])
-                processed_dict = {}
+    # スプレッドシート側の通信エラー対策として最大3回リトライ
+    for attempt in range(3):
+        try:
+            payload = {
+                'action': 'get_race_list',
+                'date': ''  # 日付による弾きを完全防止
+            }
+            response = requests.post(
+                GAS_WEBAPP_URL,
+                data=json.dumps(payload),
+                headers={'Content-Type': 'application/json'},
+                timeout=20
+            )
+            if response.status_code == 200:
+                res_json = force_parse_json(response.json())
+                if isinstance(res_json, dict) and res_json.get('status') == 'SUCCESS':
+                    raw_data = res_json.get('data', [])
+                    processed_dict = {}
 
-                def extract_race_objects(obj):
-                    if isinstance(obj, str):
-                        parsed = deep_parse_json(obj)
-                        if isinstance(parsed, (dict, list)):
-                            extract_race_objects(parsed)
-                        return
+                    def extract_race_objects(obj):
+                        if isinstance(obj, str):
+                            parsed = force_parse_json(obj)
+                            if isinstance(parsed, (dict, list)):
+                                extract_race_objects(parsed)
+                            return
 
-                    if isinstance(obj, dict):
-                        if 'keibajo' in obj and 'races' in obj:
-                            kj = clean_text(str(obj.get('keibajo')))
-                            kai = clean_text(str(obj.get('kai', '')))
-                            nichi = clean_text(str(obj.get('nichi', '')))
-                            races = obj.get('races', {})
-                            if isinstance(races, str):
-                                races = deep_parse_json(races)
-                            if isinstance(races, dict):
-                                cleaned_races = {clean_text(k): clean_text(v) for k, v in races.items()}
-                                course_info = get_course_info(kj, kai, nichi) if kai and nichi else "開催区分"
-                                processed_dict[kj] = {
-                                    'races': cleaned_races,
-                                    'course_info': course_info
-                                }
-                        else:
-                            for v in obj.values():
-                                extract_race_objects(v)
-                    elif isinstance(obj, list):
-                        for item in obj:
-                            extract_race_objects(item)
+                        if isinstance(obj, dict):
+                            if 'keibajo' in obj and 'races' in obj:
+                                kj = clean_text(str(obj.get('keibajo')))
+                                kai = clean_text(str(obj.get('kai', '')))
+                                nichi = clean_text(str(obj.get('nichi', '')))
+                                races = obj.get('races', {})
+                                
+                                # racesが文字列のまま残っている場合の強行解凍
+                                if isinstance(races, str):
+                                    races = force_parse_json(races)
+                                
+                                if isinstance(races, dict):
+                                    cleaned_races = {clean_text(k): clean_text(v) for k, v in races.items()}
+                                    course_info = get_course_info(kj, kai, nichi) if kai and nichi else "開催区分"
+                                    # 同じ競馬場があれば統合
+                                    if kj in processed_dict:
+                                        processed_dict[kj]['races'].update(cleaned_races)
+                                        processed_dict[kj]['course_info'] = course_info
+                                    else:
+                                        processed_dict[kj] = {
+                                            'races': cleaned_races,
+                                            'course_info': course_info
+                                        }
+                            else:
+                                for v in obj.values():
+                                    extract_race_objects(v)
+                        elif isinstance(obj, list):
+                            for item in obj:
+                                extract_race_objects(item)
 
-                extract_race_objects(raw_data)
-                return processed_dict
+                    extract_race_objects(raw_data)
+                    if processed_dict:
+                        return processed_dict
 
-    except Exception as e:
-        logging.error(f"Failed to fetch race_list info from GAS: {e}")
+        except Exception as e:
+            logging.error(f"Failed to fetch race_list info from GAS (Attempt {attempt+1}): {e}")
     return {}
 
 def get_course_info(keibajo, kai, nichi):
     try:
         kai_str = f"{kai}回"
         nichi_num = int(nichi)
-        clean_kj = clean_text(keibajo)
-        if clean_kj in COURSE_MASTER and kai_str in COURSE_MASTER[clean_kj]:
-            for course, day_range in COURSE_MASTER[clean_kj][kai_str].items():
-                if nichi_num in day_range:
-                    return f"{course}コース（開幕{nichi_num}日目）"
+        # keibajoはclean_textされている可能性があるためCOURSE_MASTERも柔軟に
+        for master_kj, data in COURSE_MASTER.items():
+            if clean_text(master_kj) == keibajo or master_kj in keibajo:
+                if kai_str in data:
+                    for course, day_range in data[kai_str].items():
+                        if nichi_num in day_range:
+                            return f"{course}コース（開幕{nichi_num}日目）"
     except Exception as e:
         logging.error(f"Course master lookup error: {e}")
     return "開催区分"
@@ -265,7 +297,7 @@ def load_json_file(filepath):
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                data = deep_parse_json(data)
+                data = force_parse_json(data)
                 if isinstance(data, dict) and data.get('date') == get_jst_today():
                     return data.get('data', {})
         except Exception as e:
@@ -391,6 +423,9 @@ def handle_image(event):
                     except Exception:
                         continue
 
+                # ==========================================
+                # LIST 画像の処理
+                # ==========================================
                 if image_type == 'LIST':
                     extract_list_prompt = (
                         "この画像から【開催競馬場名】と【各レース(1R〜12R)のコース・距離・条件】、【開催節情報（例：1回〇〇4日）】を抽出し、以下のJSON形式のみで出力してください。\n"
@@ -407,7 +442,7 @@ def handle_image(event):
                             )
                             if res and res.text:
                                 raw_text = str(res.text).replace('```json', '').replace('```', '').strip()
-                                list_json = deep_parse_json(raw_text)
+                                list_json = force_parse_json(raw_text)
                                 break
                         except Exception:
                             continue
@@ -416,12 +451,15 @@ def handle_image(event):
                         keibajo = clean_text(str(list_json.get('keibajo')))
                         kai = clean_text(str(list_json.get('kai', '')))
                         nichi = clean_text(str(list_json.get('nichi', '')))
-                        course_info = get_course_info(keibajo, kai, nichi) if kai and nichi else "開催区分"
-
-                        races_input = list_json.get('races', {})
+                        
+                        races_input = force_parse_json(list_json.get('races', {}))
                         cleaned_races_input = {}
                         if isinstance(races_input, dict):
                             cleaned_races_input = {clean_text(k): clean_text(v) for k, v in races_input.items()}
+
+                        # 元の名前（表示用）を取り出す処理
+                        original_kj = str(list_json.get('keibajo'))
+                        course_info = get_course_info(original_kj, kai, nichi) if kai and nichi else "開催区分"
 
                         current_list = load_json_file(RACE_LIST_FILE)
                         current_list[keibajo] = {
@@ -430,7 +468,7 @@ def handle_image(event):
                         }
                         save_json_file(RACE_LIST_FILE, current_list)
                         send_to_gas_async('save_race_list', list_json)
-                        reply_text = f"【本日の{keibajo}競馬場 全レース一覧・コース情報（{course_info}）を記憶しました】"
+                        reply_text = f"【本日の{original_kj}競馬場 全レース一覧・コース情報（{course_info}）を記憶しました】"
                     else:
                         reply_text = "⚠️ 全レース一覧の読み取りに失敗しました。画像を明るく撮影し直して再送してください。"
 
@@ -439,6 +477,9 @@ def handle_image(event):
                         m_api.reply_message(ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)]))
                     return
 
+                # ==========================================
+                # BABA 画像の処理
+                # ==========================================
                 elif image_type == 'BABA':
                     extract_baba_prompt = (
                         "この馬場情報画像から【競馬場名】、【天候】、【芝の馬場状態】、【ダートの馬場状態】を抽出し、以下のJSON形式のみで出力してください。\n"
@@ -455,13 +496,14 @@ def handle_image(event):
                             )
                             if res and res.text:
                                 raw_text = str(res.text).replace('```json', '').replace('```', '').strip()
-                                baba_json = deep_parse_json(raw_text)
+                                baba_json = force_parse_json(raw_text)
                                 break
                         except Exception:
                             continue
 
                     if isinstance(baba_json, dict) and baba_json.get('keibajo') and baba_json.get('keibajo') != "不明":
                         keibajo = clean_text(str(baba_json.get('keibajo')))
+                        original_kj = str(baba_json.get('keibajo'))
                         current_baba = load_json_file(BABA_FILE)
                         current_baba[keibajo] = {
                             'tenko': clean_text(str(baba_json.get('tenko', '不明'))),
@@ -473,7 +515,7 @@ def handle_image(event):
 
                         reply_text = (
                             f"【本日の馬場情報を更新・記憶しました】\n"
-                            f"📍 競馬場：【{keibajo}競馬場】\n"
+                            f"📍 競馬場：【{original_kj}競馬場】\n"
                             f"🌤 天候：{current_baba[keibajo]['tenko']}\n"
                             f"🌿 芝：{current_baba[keibajo]['shiba']}\n"
                             f"🟫 ダート：{current_baba[keibajo]['dirt']}"
@@ -486,6 +528,9 @@ def handle_image(event):
                         m_api.reply_message(ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)]))
                     return
 
+                # ==========================================
+                # TREND 画像の処理
+                # ==========================================
                 elif image_type == 'TREND':
                     extract_trend_prompt = (
                         "送られた画像（本日の傾向：馬番・騎手・脚質画面）から【競馬場名】と【各レースの好走馬（脚質傾向・馬番傾向・好調騎手）】を抽出し、以下のJSON形式のみで出力してください。\n"
@@ -502,13 +547,14 @@ def handle_image(event):
                             )
                             if res and res.text:
                                 raw_text = str(res.text).replace('```json', '').replace('```', '').strip()
-                                trend_json = deep_parse_json(raw_text)
+                                trend_json = force_parse_json(raw_text)
                                 break
                         except Exception:
                             continue
 
                     if isinstance(trend_json, dict) and trend_json.get('keibajo') and trend_json.get('keibajo') != "不明":
                         keibajo = clean_text(str(trend_json.get('keibajo')))
+                        original_kj = str(trend_json.get('keibajo'))
                         summary_str = str(trend_json.get('summary', ''))
                         current_trend = load_json_file(TREND_FILE)
                         current_trend[keibajo] = {
@@ -518,7 +564,7 @@ def handle_image(event):
                         send_to_gas_async('save_trend', trend_json)
 
                         reply_text = (
-                            f"【本日の{keibajo}競馬場 リアルタイム傾向（バイアス）を記憶しました】\n"
+                            f"【本日の{original_kj}競馬場 リアルタイム傾向（バイアス）を記憶しました】\n"
                             f"📊 傾向分析：{summary_str}\n\n"
                             f"※後半レースの予想作成時にこのバイアスを組み込んで自動分析します。"
                         )
@@ -530,6 +576,11 @@ def handle_image(event):
                         m_api.reply_message(ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)]))
                     return
 
+                # ==========================================
+                # 出馬表（RACE）の解析とAI予想生成（メイン）
+                # ==========================================
+                
+                # 1. ローカルデータ確認＆GAS同期
                 baba_data = load_json_file(BABA_FILE)
                 if not baba_data:
                     gas_baba = fetch_baba_from_gas()
@@ -546,6 +597,7 @@ def handle_image(event):
 
                 list_data = load_json_file(RACE_LIST_FILE)
 
+                # 2. 画像から競馬場とレース番号を抽出
                 race_info_prompt = (
                     "送られた画像内に印字されている『競馬場名』と『レース番号』を、視覚的に文字をそのまま抽出してください。\n"
                     "【絶対厳守ルール：ハルシネーション・忖度禁止】\n"
@@ -556,6 +608,7 @@ def handle_image(event):
                     "※JSON以外の文字列は一切出力禁止。"
                 )
                 keibajo_name, race_num = "", ""
+                original_keibajo_name = ""
                 for m_name in candidate_models:
                     try:
                         info_res = ai_client.models.generate_content(
@@ -565,12 +618,13 @@ def handle_image(event):
                         )
                         if info_res and info_res.text:
                             raw_i = str(info_res.text).replace('```json', '').replace('```', '').strip()
-                            info_json = deep_parse_json(raw_i)
+                            info_json = force_parse_json(raw_i)
                             if isinstance(info_json, dict):
-                                keibajo_name = clean_text(str(info_json.get('keibajo', '不明')))
+                                original_keibajo_name = str(info_json.get('keibajo', '不明'))
+                                keibajo_name = clean_text(original_keibajo_name)
                                 raw_r = clean_text(str(info_json.get('race_num', '不明')))
-                                if raw_r != "不明" and not raw_r.endswith('R'):
-                                    race_num = f"{raw_r}R"
+                                if raw_r != "不明" and not raw_r.endswith('r'):
+                                    race_num = f"{raw_r}r"
                                 else:
                                     race_num = raw_r
                                 break
@@ -584,6 +638,7 @@ def handle_image(event):
                         m_api.reply_message(ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)]))
                     return
 
+                # 3. 照合と不足時のGAS全件取得（あいまい検索）
                 matched_keibajo_key = None
                 if isinstance(list_data, dict):
                     for k in list_data.keys():
@@ -607,13 +662,13 @@ def handle_image(event):
                                 matched_keibajo_key = k
                                 break
 
+                # 4. コース種別と距離の特定
                 track_type = ""
                 distance_num = ""
-
                 m_race_num = re.search(r'\d+', race_num)
+                race_num_only = m_race_num.group(0) if m_race_num else ""
 
                 if matched_keibajo_key and 'races' in list_data[matched_keibajo_key]:
-                    keibajo_name = matched_keibajo_key
                     races_dict = list_data[matched_keibajo_key].get('races', {})
                     target_condition = None
 
@@ -621,14 +676,14 @@ def handle_image(event):
                         for r_key, cond_str in races_dict.items():
                             clean_r_key = clean_text(r_key)
                             m_key = re.search(r'\d+', clean_r_key)
-                            if m_key and m_race_num and m_key.group(0) == m_race_num.group(0):
+                            if m_key and race_num_only and m_key.group(0) == race_num_only:
                                 target_condition = str(cond_str)
                                 break
 
                     if target_condition:
-                        if "ダ" in target_condition:
+                        if "ダ" in target_condition or "だ" in target_condition:
                             track_type = "ダート"
-                        elif "芝" in target_condition:
+                        elif "芝" in target_condition or "し" in target_condition:
                             track_type = "芝"
                         
                         m_dist = re.search(r'\d+', target_condition)
@@ -637,14 +692,15 @@ def handle_image(event):
 
                 if not track_type or not distance_num:
                     reply_text = (
-                        f"⚠️ [{keibajo_name}{race_num}] のコース条件をスプレッドシートから引き抜けませんでした。\n"
-                        f"本日の【{keibajo_name}競馬場 全レース一覧】画像をLINEに送信して記録させてから、再度送信してください。"
+                        f"⚠️ [{original_keibajo_name}{race_num_only}R] のコース条件をスプレッドシートから引き抜けませんでした。\n"
+                        f"本日の【{original_keibajo_name}競馬場 全レース一覧】画像をLINEに送信して記録させてから、再度送信してください。"
                     )
                     with ApiClient(configuration) as api_client_inner:
                         m_api = MessagingApi(api_client_inner)
                         m_api.reply_message(ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)]))
                     return
 
+                # 5. コンテキストの構築
                 baba_context_str = "【記憶されている本日のリアルタイム馬場・コース情報】\n"
                 if baba_data:
                     for k, v in baba_data.items():
@@ -660,11 +716,11 @@ def handle_image(event):
                 else:
                     trend_context_str += "・未設定（標準傾向として判定）\n"
 
-                past_results_str = fetch_past_results_from_gas(keibajo_name, track_type, distance_num)
+                past_results_str = fetch_past_results_from_gas(matched_keibajo_key, track_type, distance_num)
                 past_data_context = ""
                 if past_results_str:
                     past_data_context = (
-                        f"\n【スプレッドシートから取得した[{keibajo_name} {track_type}{distance_num}m]の直近同条件過去データ（参照用）】\n"
+                        f"\n【スプレッドシートから取得した[{original_keibajo_name} {track_type}{distance_num}m]の直近同条件過去データ（参照用）】\n"
                         "以下の過去同条件データから、該当コースの『勝ちタイム水準』『上がり3Fタイム限界値』『好走馬の4角通過順傾向』を抽出し、今回の出走馬の走破能力と照らし合わせて判定に反映させてください。\n"
                         "※直近（最新）の1〜2件の通過順・脚質傾向を特に強く評価してください。\n"
                         + past_results_str[:3000] + "\n"
@@ -672,10 +728,10 @@ def handle_image(event):
 
                 confirmed_condition_str = (
                     f"【絶対確定条件（※AI改変・推測禁止）】\n"
-                    f"・対象レース：{keibajo_name}{race_num}\n"
+                    f"・対象レース：{original_keibajo_name}{race_num_only}R\n"
                     f"・コース種別：{track_type}\n"
                     f"・距離：{distance_num}m\n"
-                    f"※画像の見た目や誤認識に惑わされず、上記【{keibajo_name}{race_num} {track_type}{distance_num}m】を100%正解としてタイトルおよび分析文の前提に適用すること。\n\n"
+                    f"※画像の見た目や誤認識に惑わされず、上記【{original_keibajo_name}{race_num_only}R {track_type}{distance_num}m】を100%正解としてタイトルおよび分析文の前提に適用すること。\n\n"
                 )
 
                 prompt = (
@@ -688,7 +744,7 @@ def handle_image(event):
                     + trend_context_str
                     + past_data_context + "\n"
                     "【絶対厳守ルール（画像認識およびデータの誤読防止）】\n"
-                    "1. タイトル表記：冒頭は必ず『【" + keibajo_name + race_num + " " + track_type + distance_num + "m】』のように【絶対確定条件】をそのまま完全に記述すること。（「ダート」と「芝」の誤表記は厳禁）。\n"
+                    "1. タイトル表記：冒頭は必ず『【" + original_keibajo_name + race_num_only + "R " + track_type + distance_num + "m】』のように【絶対確定条件】をそのまま完全に記述すること。（「ダート」と「芝」の誤表記は厳禁）。\n"
                     "2. 枠番と馬番の絶対識別：\n"
                     "   ・画像上のカラー背景（ピンクや緑など）にある数字は『枠番』です。絶対に馬番と混同しないでください。\n"
                     "   ・『馬番』は馬名のすぐ左にある白地の列の数字（例: 10番など）です。買い目や印には必ず『馬番』のみを記述すること。\n"
@@ -715,7 +771,7 @@ def handle_image(event):
                     "   ・買い目構成（1着/2着/3着、1頭目/2頭目/3頭目など）は【必ず改行した縦並び】で視認性良く出力すること。\n"
                     "11. 過去データの照合：スプレッドシートの同条件過去データから勝ちタイム水準・上がり時計・直近の通過順傾向を参照し、今回の出走馬の数値と客観的に比較して根拠に組み込むこと。\n\n"
                     "【出力フォーマット（※指定以外の文字列・記号は一切追加禁止）】\n"
-                    f"■ 1. レース概要：【{keibajo_name}{race_num} {track_type}{distance_num}m】 [レース波乱度：順当／混戦／波乱から選定]\n"
+                    f"■ 1. レース概要：【{original_keibajo_name}{race_num_only}R {track_type}{distance_num}m】 [レース波乱度：順当／混戦／波乱から選定]\n"
                     "（展開・馬場・本日バイアス・過去データ照合に基づく分析）\n\n"
                     "■ 2. 印・推奨理由と連対期待度\n"
                     "◎ 【本命】 〇番 馬名（騎手名） [連対期待度：〇%]\n"
