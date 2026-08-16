@@ -525,11 +525,6 @@ def handle_image(event):
                         save_json_file(TREND_FILE, trend_data)
 
                 list_data = load_json_file(RACE_LIST_FILE)
-                if not list_data:
-                    gas_list = fetch_race_list_from_gas()
-                    if gas_list:
-                        list_data = gas_list
-                        save_json_file(RACE_LIST_FILE, list_data)
 
                 race_info_prompt = (
                     "送られた画像内に印字されている『競馬場名』と『レース番号』を、視覚的に文字をそのまま抽出してください。\n"
@@ -569,10 +564,26 @@ def handle_image(event):
                     return
 
                 matched_keibajo_key = None
-                for k in list_data.keys():
-                    if k and (k == keibajo_name or k in keibajo_name):
-                        matched_keibajo_key = k
-                        break
+                if isinstance(list_data, dict):
+                    for k in list_data.keys():
+                        if k and (k == keibajo_name or k in keibajo_name):
+                            matched_keibajo_key = k
+                            break
+
+                # 【修正ポイント】ローカルに該当競馬場がない場合、即座にGASから全データを取得してマージ・同期する
+                if not matched_keibajo_key:
+                    gas_list = fetch_race_list_from_gas()
+                    if isinstance(gas_list, dict) and gas_list:
+                        if isinstance(list_data, dict):
+                            list_data.update(gas_list)
+                        else:
+                            list_data = gas_list
+                        save_json_file(RACE_LIST_FILE, list_data)
+                        
+                        for k in list_data.keys():
+                            if k and (k == keibajo_name or k in keibajo_name):
+                                matched_keibajo_key = k
+                                break
 
                 track_type = ""
                 distance_num = ""
