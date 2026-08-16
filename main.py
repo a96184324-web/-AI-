@@ -71,7 +71,6 @@ def get_jst_today():
 def process_image_for_ocr(image):
     try:
         w, h = image.size
-        # スマホ画面の上下UI（ブラウザヘッダー約18%・下部操作メニュー約15%）をトリミング
         crop_top = int(h * 0.18)
         crop_bottom = int(h * 0.85)
         
@@ -81,7 +80,6 @@ def process_image_for_ocr(image):
             img_cropped = image.copy()
 
         img_copy = img_cropped.copy()
-        # APIコストを抑える1280px枠内で鮮明化・くっきり化処理
         img_copy.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
         enhancer = ImageEnhance.Contrast(img_copy)
         img_copy = enhancer.enhance(1.5)
@@ -316,7 +314,6 @@ def handle_image(event):
                 candidate_models = ['gemini-3.1-flash-lite', 'gemini-3.5-flash']
                 deterministic_config = types.GenerateContentConfig(temperature=0.0)
 
-                # 画像分類処理（LIST, BABA, TREND, RACE）
                 image_type = 'RACE'
                 classify_prompt = (
                     "送られた画像を判定してください。\n"
@@ -479,9 +476,6 @@ def handle_image(event):
                         m_api.reply_message(ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)]))
                     return
 
-                # 【出馬表（RACE）全頭統合予想処理】
-                
-                # スリープ・再起動時のGAS自動補完
                 baba_data = load_json_file(BABA_FILE)
                 if not baba_data:
                     gas_baba = fetch_baba_from_gas()
@@ -503,14 +497,16 @@ def handle_image(event):
                         list_data = gas_list
                         save_json_file(RACE_LIST_FILE, list_data)
 
-                # 「8日」と「8R」の誤認を完全に遮断するレース番号抽出ルール
+                # 「〇日」表記の混同を絶対阻止するレース識別プロンプト
                 race_info_prompt = (
-                    "送られた出馬表画像から【競馬場名（例: 札幌、中京）】と【絶対的なレース番号（例: 8R）】のみを抽出してください。\n"
+                    "送られた出馬表画像から【競馬場名】と【レース番号】を抽出してください。\n"
                     "【絶対識別ルール】\n"
-                    "・ヘッダーにある『1回札幌8日 8R』のような表記の場合、『8日』『8日目』の数字は開催日数です。絶対にレース番号と誤認しないでください。\n"
-                    "・必ず末尾に『R』の文字が直接付いている数字（例:『8R』なら『8』）のみを正確にレース番号として抽出すること。\n"
+                    "1. 画像ヘッダーにある『1回札幌8日 9R』のような表記を解析してください。\n"
+                    "2. 『〇日』や『〇日目』という表記に含まれる数字は絶対レース番号として抽出しないでください。\n"
+                    "3. 必ず文字『R』の直前にある数字（例:『9R』なら『9』）のみを正確にレース番号として抽出すること。\n"
+                    "4. 上記以外の数字（日付、馬番、オッズ）はすべて無視してください。\n"
                     "以下のJSON形式のみで出力してください。\n"
-                    "{\"keibajo\": \"札幌\", \"race_num\": \"8R\"}\n"
+                    "{\"keibajo\": \"札幌\", \"race_num\": \"9R\"}\n"
                     "※JSON以外出力禁止。"
                 )
                 keibajo_name, race_num = "", ""
@@ -534,7 +530,6 @@ def handle_image(event):
                     except Exception:
                         continue
 
-                # 事前保存の全レース一覧（LIST）データから100%正確な条件を取得
                 matched_keibajo_key = None
                 for k in list_data.keys():
                     if k in keibajo_name or keibajo_name in k:
@@ -542,8 +537,8 @@ def handle_image(event):
                         break
 
                 m_race_num = re.search(r'\d+', race_num)
-                track_type = "ダート"
-                distance_num = "1700"
+                track_type = "芝"
+                distance_num = "1200"
 
                 if matched_keibajo_key and 'races' in list_data[matched_keibajo_key]:
                     keibajo_name = matched_keibajo_key
@@ -581,7 +576,6 @@ def handle_image(event):
                 else:
                     trend_context_str += "・未設定（標準傾向として判定）\n"
 
-                # 確定条件でGASから同条件過去データを取得
                 past_results_str = fetch_past_results_from_gas(keibajo_name, track_type, distance_num)
                 past_data_context = ""
                 if past_results_str:
