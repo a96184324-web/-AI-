@@ -204,32 +204,39 @@ def fetch_race_list_from_gas():
                 raw_data = res_json.get('data', [])
                 processed_dict = {}
 
-                # 【完全対応】どんなデータ構造（配列・辞書・JSON文字列）で届いても再帰的に解析する
-                def extract_and_register(val):
-                    if isinstance(val, str):
+                def parse_item(item):
+                    if isinstance(item, str):
                         try:
-                            val = json.loads(val)
+                            item = json.loads(item)
                         except Exception:
-                            return
-                    if isinstance(val, dict):
-                        if 'keibajo' in val and 'races' in val:
-                            kj = str(val.get('keibajo')).strip()
-                            kai = str(val.get('kai', '')).strip()
-                            nichi = str(val.get('nichi', '')).strip()
-                            course_info = get_course_info(kj, kai, nichi) if kai and nichi else "開催区分"
-                            processed_dict[kj] = {
-                                'races': val.get('races', {}),
-                                'course_info': course_info
-                            }
-                        else:
-                            for v in val.values():
-                                extract_and_register(v)
-                    elif isinstance(val, list):
-                        for item in val:
-                            extract_and_register(item)
+                            return None
+                    return item
 
-                extract_and_register(raw_data)
-                return processed_dict
+                if isinstance(raw_data, list):
+                    for row in raw_data:
+                        parsed_row = parse_item(row)
+                        if not parsed_row:
+                            continue
+
+                        if isinstance(parsed_row, dict):
+                            target_val = parsed_row.get('コース一覧JSONデータ') or parsed_row.get('data') or parsed_row
+                            target_dict = parse_item(target_val) if isinstance(target_val, str) else target_val
+
+                            if isinstance(target_dict, dict) and 'keibajo' in target_dict:
+                                kj = str(target_dict.get('keibajo')).strip()
+                                kai = str(target_dict.get('kai', '')).strip()
+                                nichi = str(target_dict.get('nichi', '')).strip()
+                                course_info = get_course_info(kj, kai, nichi) if kai and nichi else "開催区分"
+
+                                processed_dict[kj] = {
+                                    'races': target_dict.get('races', {}),
+                                    'course_info': course_info
+                                }
+
+                    return processed_dict
+
+                elif isinstance(raw_data, dict):
+                    return raw_data
     except Exception as e:
         logging.error(f"Failed to fetch race_list info from GAS: {e}")
     return {}
@@ -531,7 +538,6 @@ def handle_image(event):
                         list_data = gas_list
                         save_json_file(RACE_LIST_FILE, list_data)
 
-                # レース情報抽出プロンプト
                 race_info_prompt = (
                     "送られた画像内に印字されている『競馬場名』と『レース番号』を、視覚的に文字をそのまま抽出してください。\n"
                     "【絶対厳守ルール：ハルシネーション・忖度禁止】\n"
@@ -562,7 +568,6 @@ def handle_image(event):
                     except Exception:
                         continue
 
-                # 【厳格ガード1】場名・レース番号が「不明」または空文字の場合は即座に処理中断
                 if not keibajo_name or keibajo_name == "不明" or not race_num or race_num == "不明":
                     reply_text = "⚠️ 競馬場名またはレース番号が正しく読み取れませんでした。\nJRAの緑色のヘッダー（〇回〇〇〇日 △R）が映っているスクリーンショットを送信してください。"
                     with ApiClient(configuration) as api_client_inner:
@@ -570,7 +575,6 @@ def handle_image(event):
                         m_api.reply_message(ReplyMessageRequest(reply_token=r_token, messages=[TextMessage(text=reply_text)]))
                     return
 
-                # 【厳格化】あいまいマッチングを廃止し、完全一致または包含関係のみを検証
                 matched_keibajo_key = None
                 for k in list_data.keys():
                     if k and (k == keibajo_name or k in keibajo_name):
@@ -603,7 +607,6 @@ def handle_image(event):
                         if m_dist:
                             distance_num = m_dist.group(0)
 
-                # 【厳格ガード2】スプレッドシートデータから条件が引き抜けなかった場合は強行せず安全停止
                 if not track_type or not distance_num:
                     reply_text = (
                         f"⚠️ [{keibajo_name}{race_num}] のコース条件をスプレッドシートから引き抜けませんでした。\n"
